@@ -1,0 +1,148 @@
+---
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex,nofollow" />
+    <title>Tag test · Deal pipeline</title>
+  </head>
+  <body>
+    <main>
+      <a href="/app/">← Back to deal pipeline</a>
+      <h1>Messy list → tagged deals</h1>
+      <p>Try Jev on the first step. Paste your list as-is, correct the result, then copy the feedback back into our chat. This test does not change your pipeline session.</p>
+      <label for="source">1. Paste the original list</label>
+      <textarea id="source" rows="10" placeholder="Paste the messy email or deal list here. Keep the broken formatting!" spellcheck="false"></textarea>
+      <div class="actions">
+        <button id="run">Sort with Jev</button>
+        <button id="clear" class="secondary">Clear test</button>
+        <span id="status" role="status" aria-live="polite"></span>
+      </div>
+      <p class="hint">Up to 160 non-empty lines per test. Jev sees the pasted text when you click Sort. Your draft is saved in this browser.</p>
+      <div class="columns">
+        <section>
+          <label for="actual">2. Jev’s result</label>
+          <textarea id="actual" rows="16" readonly placeholder="Results will appear here."></textarea>
+          <p class="hint">Review means uncertain. Ignored lines stay visible so you can catch anything missed. Wrapped lines may be joined; original wording stays intact.</p>
+        </section>
+        <section>
+          <label for="corrected">3. What it should have produced</label>
+          <textarea id="corrected" rows="16" placeholder="Run the test, then edit the copy here to show the correct result." spellcheck="false"></textarea>
+          <p class="hint">Edit freely: fix suppliers, join or split deals, change Exclusive deal / Deal, or mark clutter Ignored. Plain-English corrections are fine too.</p>
+        </section>
+      </div>
+      <details id="audit"><summary>Show decisions for each source line</summary><div class="scroll"><table><thead><tr><th>Line</th><th>Original text</th><th>Jev decision</th><th>Supplier</th><th>Confidence</th></tr></thead><tbody id="decisions"></tbody></table></div></details>
+      <label for="rating">4. How did it do?</label>
+      <select id="rating"><option value="unrated">Choose a result</option><option value="correct">Everything looks correct</option><option value="minor-fixes">Mostly right; a few corrections</option><option value="major-fixes">Needs major corrections</option><option value="failed">Could not complete the test</option></select>
+      <label for="notes">What went wrong? (optional)</label>
+      <textarea id="notes" rows="3" placeholder="For example: the Princess offer got attached to Carnival, or these two lines are separate deals."></textarea>
+      <div class="actions"><button id="copy" disabled>Copy feedback for chat</button><button id="download" class="secondary" disabled>Download feedback</button><span id="copy-status" role="status" aria-live="polite"></span></div>
+      <details><summary>Feedback block (you can also select and copy it here)</summary><textarea id="feedback" rows="12" readonly aria-label="Feedback block"></textarea></details>
+    </main>
+    <script>
+      import { feedbackBlock, tagWithJev } from '../logic/tagJev.js';
+      const $ = (id: string) => document.getElementById(id)!;
+      const field = (id: string) => $(id) as HTMLTextAreaElement;
+      const button = (id: string) => $(id) as HTMLButtonElement;
+      const rating = $('rating') as HTMLSelectElement;
+      const key = 'deal-pipeline-tag-test-v1';
+      let result: any = null;
+      let testedInput = '';
+      let error = '';
+      let running = false;
+      let dirty = false;
+      let storageWarning = '';
+      function renderDecisions() {
+        $('decisions').replaceChildren(...(result?.decisions ?? []).map((row: any) => {
+          const tr = document.createElement('tr');
+          if (row.review) tr.className = 'review';
+          for (const value of [row.number, row.text, row.kind + (row.review ? ' · review' : ''), row.supplier || 'Unknown', Math.round(row.confidence * 100) + '%']) {
+            const td = document.createElement('td'); td.textContent = String(value); tr.append(td);
+          }
+          return tr;
+        }));
+      }
+      function refresh() {
+        const raw = result || error ? testedInput : field('source').value;
+        field('feedback').value = feedbackBlock({ raw, result, corrected: field('corrected').value, notes: field('notes').value, rating: rating.value, error });
+        button('copy').disabled = button('download').disabled = running || !raw.trim() || (!result && !error);
+        try {
+          localStorage.setItem(key, JSON.stringify({ source: field('source').value, testedInput, result, corrected: field('corrected').value, notes: field('notes').value, rating: rating.value, error, dirty }));
+        } catch { storageWarning = 'Browser storage is unavailable or full; keep this tab open or download your feedback.'; $('copy-status').textContent = storageWarning; }
+      }
+      function resetResult() {
+        result = null; error = ''; testedInput = ''; dirty = false;
+        field('actual').value = ''; field('corrected').value = ''; rating.value = 'unrated';
+        renderDecisions();
+      }
+      try {
+        const saved = JSON.parse(localStorage.getItem(key) || 'null');
+        if (saved) {
+          field('source').value = saved.source || ''; testedInput = saved.testedInput || '';
+          result = saved.result; error = saved.error || ''; dirty = !!saved.dirty;
+          field('actual').value = result?.text || ''; field('corrected').value = saved.corrected || '';
+          field('notes').value = saved.notes || ''; rating.value = saved.rating || 'unrated';
+          $('status').textContent = 'Restored your last test.'; renderDecisions();
+        }
+      } catch { /* A new test still works when browser storage is unavailable. */ }
+      refresh();
+      field('source').addEventListener('input', () => {
+        $('status').textContent = (result || error) && field('source').value !== testedInput ? 'Input changed. Run again to test it; feedback still refers to the previous run.' : '';
+        refresh();
+      });
+      field('corrected').addEventListener('input', () => { dirty = true; refresh(); });
+      field('notes').addEventListener('input', refresh);
+      rating.addEventListener('change', refresh);
+      button('run').addEventListener('click', async () => {
+        if (dirty && !confirm('Start a new run and replace your corrected result? Copy or download the current feedback first if you want to keep it.')) return;
+        resetResult(); testedInput = field('source').value;
+        running = true; button('run').disabled = true; button('clear').disabled = true;
+        field('source').readOnly = true; field('corrected').readOnly = true;
+        $('status').textContent = 'Asking Jev…'; refresh();
+        try {
+          result = await tagWithJev(testedInput, async (body: any) => {
+            const response = await fetch('/api/jev', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(120_000) });
+            const data = await response.json().catch(() => { throw new Error(`Jev service returned an unreadable response (${response.status}). Please retry.`); });
+            if (!response.ok || !data.answers) throw new Error(data.error || `Jev request failed (${response.status}).`);
+            return data.answers;
+          }, (done: number, total: number) => { $('status').textContent = `Sorted ${done} of ${total} lines…`; });
+          field('actual').value = result.text; field('corrected').value = result.text;
+          renderDecisions();
+          const review = result.records.filter((row: any) => row.kind === 'review').length;
+          $('status').textContent = `Done. ${review ? `${review} item(s) need a look.` : 'Review the result and correct anything missed.'}`;
+        } catch (caught) {
+          error = caught instanceof Error ? caught.message : String(caught);
+          $('status').textContent = `Test failed: ${error} You can copy feedback about this failure.`;
+          rating.value = 'failed';
+        } finally {
+          running = false; button('run').disabled = false; button('clear').disabled = false;
+          field('source').readOnly = false; field('corrected').readOnly = false; refresh();
+        }
+      });
+      button('clear').addEventListener('click', () => {
+        if ((field('source').value || dirty) && !confirm('Clear this saved test and its corrections?')) return;
+        resetResult(); field('source').value = ''; field('notes').value = '';
+        $('status').textContent = ''; $('copy-status').textContent = ''; refresh();
+      });
+      button('copy').addEventListener('click', async () => {
+        refresh();
+        try { await navigator.clipboard.writeText(field('feedback').value); $('copy-status').textContent = 'Copied. Paste it into our chat.'; }
+        catch { field('feedback').closest('details')!.open = true; field('feedback').focus(); field('feedback').select(); $('copy-status').textContent = 'Press Ctrl+C to copy the selected feedback.'; }
+      });
+      button('download').addEventListener('click', () => {
+        refresh(); const url = URL.createObjectURL(new Blob([field('feedback').value], { type: 'text/plain;charset=utf-8' }));
+        const a = document.createElement('a'); a.href = url; a.download = 'deal-tag-feedback.txt'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+      });
+    </script>
+    <style>
+      :global(*){box-sizing:border-box} :global(body){margin:0;background:#f7f8fa;color:#172b35;font:16px/1.5 system-ui,sans-serif}
+      main{max-width:1200px;margin:auto;padding:32px 24px 64px}a{color:#185879}h1{font-size:30px;margin:24px 0 8px}p{max-width:850px}label{display:block;font-weight:650;margin:20px 0 8px}
+      textarea,select{width:100%;padding:12px;border:1px solid #8596a0;border-radius:6px;background:white;color:#172b35;font:14px/1.6 ui-monospace,monospace}textarea{resize:vertical}textarea[readonly]{background:#edf1f4}select{max-width:400px;font-family:inherit}
+      button{padding:10px 16px;border:1px solid #174f62;border-radius:6px;background:#174f62;color:white;font:600 15px system-ui;cursor:pointer}.secondary{background:white;color:#174f62}button:disabled{opacity:.55;cursor:default}
+      :is(button,a,textarea,select,summary):focus-visible{outline:3px solid #b05b0c;outline-offset:3px}.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:14px 0}.hint{font-size:13px;color:#4d606d}.columns{display:grid;grid-template-columns:1fr 1fr;gap:24px}details{margin:20px 0}summary{cursor:pointer;font-weight:600}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px}td,th{text-align:left;padding:8px;border-bottom:1px solid #bac5cc}.review{background:#fff0d4}
+      @media(max-width:700px){main{padding:20px 16px}.columns{grid-template-columns:1fr;gap:0}h1{font-size:25px}}
+    </style>
+  </body>
+</html>

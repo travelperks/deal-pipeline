@@ -1,8 +1,8 @@
 // Cloudflare Pages Function: server-side proxy to TypeSafe Jev (DEC-07).
 // Same behavior as api/jev.js (the Vercel version, kept until cutover).
 // The API key lives only in the JEV_API_KEY secret on the Pages project and
-// never reaches the browser. Only the deal-matching question shapes are forwarded.
-const ALLOWED = /^(status|match|adds_w\d{1,3})$/;
+// never reaches the browser. Matching and the isolated tagging test share this proxy.
+const ALLOWED = /^(status|match|adds_w\d{1,3}|tag_(kind|supplier)_l\d{1,3})$/;
 const MAX_BYTES = 60_000;
 
 const json = (body, status) => Response.json(body, { status });
