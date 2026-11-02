@@ -13,28 +13,31 @@
       <a href="/app/">← Back to deal pipeline</a>
       <h1>Messy list → tagged deals</h1>
       <p>Try Jev on the first step. Paste your list as-is, correct the result, then copy the feedback back into our chat. This test does not change your pipeline session.</p>
-      <label for="source">1. Paste the original list</label>
+      <details id="source-panel" open><summary>1. Original pasted email</summary>
+      <label for="source">Paste the original list</label>
       <textarea id="source" rows="10" placeholder="Paste the messy email or deal list here. Keep the broken formatting!" spellcheck="false"></textarea>
+      </details>
       <div class="actions">
         <button id="run">Sort with Jev</button>
         <button id="clear" class="secondary">Clear test</button>
         <span id="status" role="status" aria-live="polite"></span>
       </div>
       <p class="hint">Paste the whole email, including headers and footers. Long lists are processed automatically in batches. Jev sees the pasted text when you click Sort. Your draft is saved in this browser.</p>
-      <div class="columns">
-        <section>
-          <label for="actual">2. Jev’s result</label>
-          <textarea id="actual" rows="16" readonly placeholder="Results will appear here."></textarea>
-          <p class="hint">Review means uncertain. Ignored lines stay visible so you can catch anything missed. Wrapped lines may be joined; original wording stays intact.</p>
-        </section>
-        <section>
-          <label for="corrected">3. What it should have produced</label>
+      <section id="finished" aria-labelledby="finished-title">
+        <h2 id="finished-title">2. Finished deal list</h2>
+        <p id="result-summary" role="status">Your sorted deals will appear here, grouped by supplier.</p>
+        <p id="processing-summary" class="hint"></p>
+        <div id="finished-list"></div>
+      </section>
+      <details id="skipped"><summary id="skipped-title">Email text left out</summary><div id="skipped-list"></div></details>
+      <details><summary>Make corrections (optional)</summary>
+          <label for="corrected">What it should have produced</label>
           <textarea id="corrected" rows="16" placeholder="Run the test, then edit the copy here to show the correct result." spellcheck="false"></textarea>
           <p class="hint">Edit freely: fix suppliers, join or split deals, change Exclusive deal / Deal, or mark clutter Ignored. Plain-English corrections are fine too.</p>
-        </section>
-      </div>
+      </details>
+      <details><summary>Raw tagged output</summary><label for="actual">Original tagging result</label><textarea id="actual" rows="12" readonly></textarea></details>
       <details id="audit"><summary>Show decisions for each source line</summary><div class="scroll"><table><thead><tr><th>Line</th><th>Original text</th><th>Jev decision</th><th>Supplier</th><th>Confidence</th></tr></thead><tbody id="decisions"></tbody></table></div></details>
-      <label for="rating">4. How did it do?</label>
+      <label for="rating">3. How did it do?</label>
       <select id="rating"><option value="unrated">Choose a result</option><option value="correct">Everything looks correct</option><option value="minor-fixes">Mostly right; a few corrections</option><option value="major-fixes">Needs major corrections</option><option value="failed">Could not complete the test</option></select>
       <label for="notes">What went wrong? (optional)</label>
       <textarea id="notes" rows="3" placeholder="For example: the Princess offer got attached to Carnival, or these two lines are separate deals."></textarea>
@@ -43,6 +46,7 @@
     </main>
     <script>
       import { feedbackBlock, tagWithJev } from '../logic/tagJev.js';
+      import { buildTagPreview } from '../logic/tagPreview.js';
       const $ = (id: string) => document.getElementById(id)!;
       const field = (id: string) => $(id) as HTMLTextAreaElement;
       const button = (id: string) => $(id) as HTMLButtonElement;
@@ -54,11 +58,35 @@
       let running = false;
       let dirty = false;
       let storageWarning = '';
+      function renderFinished() {
+        const preview = buildTagPreview(result?.records, result?.decisions);
+        $('finished-list').replaceChildren();
+        $('result-summary').textContent = result ? `${preview.offers} offers · ${preview.groups.length} suppliers · ${preview.review} items need a look` : 'Your sorted deals will appear here, grouped by supplier.';
+        $('processing-summary').textContent = result?.stats ? `${result.stats.localLines} lines handled locally · ${result.stats.jevLines} sent to Jev · ${result.stats.requests} Jev requests` : '';
+        for (const group of preview.groups) {
+          const section = document.createElement('section'); section.className = 'supplier-group';
+          const heading = document.createElement('h3'); heading.textContent = group.supplier; section.append(heading);
+          const list = document.createElement('ul');
+          for (const item of group.items) {
+            const row = document.createElement('li');
+            if (item.needsReview) row.className = 'needs-review';
+            for (const label of [...(item.exclusive ? [item.needsReview ? 'Exclusive?' : 'Exclusive'] : []), ...(item.needsReview ? ['Needs a look'] : []), ...(item.heading ? ['Supplier heading'] : [])]) {
+              const badge = document.createElement('span'); badge.className = label === 'Exclusive' ? 'badge exclusive' : 'badge'; badge.textContent = label; row.append(badge);
+            }
+            const text = document.createElement('span'); text.textContent = item.text; row.append(text); list.append(row);
+          }
+          section.append(list); $('finished-list').append(section);
+        }
+        $('skipped-title').textContent = `Email text left out (${preview.ignored.length} lines)`;
+        $('skipped-list').replaceChildren(...preview.ignored.map(item => { const p = document.createElement('p'); p.textContent = item.text; return p; }));
+        if (result) ($('source-panel') as HTMLDetailsElement).open = false;
+      }
       function renderDecisions() {
+        renderFinished();
         $('decisions').replaceChildren(...(result?.decisions ?? []).map((row: any) => {
           const tr = document.createElement('tr');
           if (row.review) tr.className = 'review';
-          for (const value of [row.number, row.text, row.kind + (row.review ? ' · review' : ''), row.supplier || 'Unknown', Math.round(row.confidence * 100) + '%']) {
+          for (const value of [row.number, row.text, row.kind + (row.review ? ' · review' : '') + (row.source === 'local' ? ' · local' : ''), row.supplier || 'Unknown', Math.round(row.confidence * 100) + '%']) {
             const td = document.createElement('td'); td.textContent = String(value); tr.append(td);
           }
           return tr;
@@ -107,7 +135,7 @@
             const data = await response.json().catch(() => { throw new Error(`Jev service returned an unreadable response (${response.status}). Please retry.`); });
             if (!response.ok || !data.answers) throw new Error(data.error || `Jev request failed (${response.status}).`);
             return data.answers;
-          }, (done: number, total: number) => { $('status').textContent = `Sorted ${done} of ${total} lines…`; });
+          }, (done: number, total: number, stats: any) => { $('status').textContent = `Sorted ${done} of ${total} lines… ${stats.localLines} handled locally, ${stats.jevLines} sent to Jev.`; });
           field('actual').value = result.text; field('corrected').value = result.text;
           renderDecisions();
           const review = result.records.filter((row: any) => row.kind === 'review').length;
@@ -124,6 +152,7 @@
       button('clear').addEventListener('click', () => {
         if ((field('source').value || dirty) && !confirm('Clear this saved test and its corrections?')) return;
         resetResult(); field('source').value = ''; field('notes').value = '';
+        ($('source-panel') as HTMLDetailsElement).open = true;
         $('status').textContent = ''; $('copy-status').textContent = ''; refresh();
       });
       button('copy').addEventListener('click', async () => {
@@ -143,6 +172,13 @@
       button{padding:10px 16px;border:1px solid #174f62;border-radius:6px;background:#174f62;color:white;font:600 15px system-ui;cursor:pointer}.secondary{background:white;color:#174f62}button:disabled{opacity:.55;cursor:default}
       :is(button,a,textarea,select,summary):focus-visible{outline:3px solid #b05b0c;outline-offset:3px}.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:14px 0}.hint{font-size:13px;color:#4d606d}.columns{display:grid;grid-template-columns:1fr 1fr;gap:24px}details{margin:20px 0}summary{cursor:pointer;font-weight:600}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px}td,th{text-align:left;padding:8px;border-bottom:1px solid #bac5cc}.review{background:#fff0d4}
       @media(max-width:700px){main{padding:20px 16px}.columns{grid-template-columns:1fr;gap:0}h1{font-size:25px}}
+      #finished{margin:28px 0}#finished h2{margin-bottom:6px}#result-summary{font-weight:600}#skipped-list{font-size:14px;color:#4d606d}
+      :global(.supplier-group){background:white;border:1px solid #c9d3d9;border-radius:8px;margin:20px 0;padding:20px 24px}
+      :global(.supplier-group h3){font-size:22px;margin:0 0 12px;color:#174f62}:global(.supplier-group ul){list-style:none;margin:0;padding:0}
+      :global(.supplier-group li){padding:12px 0;border-top:1px solid #e1e6ea;line-height:1.6;overflow-wrap:anywhere}
+      :global(.supplier-group li.needs-review){background:#fff7e7;border-left:3px solid #bd7414;padding:12px;margin:6px 0}
+      :global(.badge){display:inline-block;font-size:12px;font-weight:650;background:#fbe6bb;color:#65400b;border-radius:4px;padding:2px 7px;margin:0 8px 4px 0}
+      :global(.badge.exclusive){background:#dfedf1;color:#174f62}
     </style>
   </body>
 </html>

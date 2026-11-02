@@ -1,6 +1,6 @@
-import { supplierNames } from './suppliers.js';
+import { supplierNames, resolveVendor } from './suppliers.js';
 
-export const TAG_TEST_VERSION = 'tag-test-v2';
+export const TAG_TEST_VERSION = 'tag-test-v3';
 const KINDS = {
   supplier: 'A supplier heading; not an offer.',
   deal: 'The start of a public deal or offer.',
@@ -18,13 +18,53 @@ export function inputLines(raw) {
   return lines;
 }
 
+// Only clear, standalone cases bypass Jev. Wrapped, mixed, or uncertain lines
+// still go to Jev with the nearby source text, including locally handled lines.
+export function preclassifyLines(lines) {
+  const answers = {};
+  let current = '';
+  let exclusiveSection = false;
+  const put = (line, kind, supplier = '') => {
+    const choice = supplier ? `s${supplierNames.indexOf(supplier)}` : 'unknown';
+    answers[`tag_kind_${line.id}`] = { choice: kind, confidence: 1, source: 'local' };
+    answers[`tag_supplier_${line.id}`] = { choice, confidence: 1, source: 'local' };
+  };
+  for (const line of lines) {
+    const text = line.text.replace(/^[•*\-–]+\s*/, '').trim();
+    const vendor = resolveVendor(text.replace(/[:：]$/, ''));
+    if (vendor.status === 'known' && vendor.tagEligible && ['canonical', 'alias'].includes(vendor.matchedBy)) {
+      current = vendor.canonicalName; put(line, 'supplier', current); continue;
+    }
+    if (/^(?:(?:contemporary|premium|luxury|river|expedition|land|resort|tour|cruise|all|current|weekly)\s+)+(?:cruise\s+|land\s+)?(?:offers|promotions)\s*[:!]?$/i.test(text)) {
+      current = ''; exclusiveSection = false; put(line, 'ignore'); continue;
+    }
+    if (/^(?:(?:TLN|Travel Leaders)\s+)?exclusive\s+(?:offers|promotions|deals)\s*[:!]?$/i.test(text)) {
+      exclusiveSection = true; put(line, 'ignore'); continue;
+    }
+    if (/^(?:Weekly Promo Recap\b|Weekly Promotions\s*<|Document is for Internal Use Only\b|Happy (?:Monday|Tuesday|Wednesday|Thursday|Friday|selling)\b|Helpful Links\s*:|Return & Earn Program\s*$|Covert Rates\s*$|Agent Incentives & Bonus Commission\s*$|Important Land Information\s*$|Detailed Promotion Backup Spreadsheet\b|TLN Direct Mail Promotion Page\s*$|Unsubscribe\b|https?:\/\/\S+$)/i.test(text) || /^[^\n]*<[^<>\s]+@[^<>\s]+>[^\n]*$/.test(text) || !/[\p{L}\p{N}]/u.test(text)) {
+      put(line, 'ignore'); continue;
+    }
+    const otherSupplier = supplierNames.some(name => name !== current && text.toLowerCase().includes(name.toLowerCase()));
+    const offer = /\b(?:save|savings|rates?|sale|off|OBC|onboard credit|deposits?|upgrade|free|discount|bonus|gratuities|airfare)\b/i.test(text) && /\d|[$%]/.test(text);
+    if (current && offer && !otherSupplier && !/^(?:\(|and\b|plus\b|with\b|through\b|ends?\b|book by\b)/i.test(text)) {
+      put(line, exclusiveSection || /\b(?:EXCLUSIVE|TLN)\b/i.test(text) ? 'exclusive' : 'deal', current);
+    } else if (otherSupplier || (!offer && text.length < 100 && /^[\p{L}\s&/'’().:-]+$/u.test(text))) {
+      // An unfamiliar heading breaks the old supplier's scope until Jev resolves it.
+      current = '';
+    }
+  }
+  return answers;
+}
+
 export function buildTagRequest(lines, batch, priorContext = {}) {
   const start = lines.findIndex(line => line.id === batch[0].id);
+  const end = lines.findIndex(line => line.id === batch.at(-1).id) + 1;
   // Repeat bounded nearby context, not the full email, on every request.
   const before = lines.slice(Math.max(0, start - 12), start);
-  const after = lines.slice(start + batch.length, start + batch.length + 8);
+  const after = lines.slice(end, end + 8);
+  const between = lines.slice(start, end).filter(line => !batch.some(target => target.id === line.id));
   let remaining = 12_000;
-  const nearby = [...before.reverse(), ...after].filter(line => {
+  const nearby = [...between, ...before.reverse(), ...after].filter(line => {
     if (line.text.length > remaining) return false;
     remaining -= line.text.length;
     return true;
@@ -67,7 +107,7 @@ export function assembleTagResult(lines, answers) {
     const name = supplier.choice === 'unknown' ? '' : SUPPLIERS[supplier.choice];
     const confidence = kind.choice === 'ignore' ? kind.confidence : Math.min(kind.confidence, supplier.confidence);
     const uncertain = confidence < 0.8 || kind.choice === 'review' || (!name && kind.choice !== 'ignore');
-    decisions.push({ ...line, kind: kind.choice, supplier: name, confidence, review: uncertain });
+    decisions.push({ ...line, kind: kind.choice, supplier: name, confidence, review: uncertain, source: answers[`tag_kind_${line.id}`].source || 'jev' });
     const previous = records.at(-1);
     if (!uncertain && kind.choice === 'continuation' && previous && ['deal', 'exclusive'].includes(previous.kind) && previous.supplier === name) {
       previous.text += ` ${line.text}`;
@@ -83,23 +123,32 @@ export function assembleTagResult(lines, answers) {
 
 export async function tagWithJev(raw, call, onProgress = () => {}) {
   const lines = inputLines(raw);
-  const answers = {};
+  const answers = preclassifyLines(lines);
+  const localLines = Object.keys(answers).length / 2;
+  let jevLines = 0;
+  let requests = 0;
+  let requestCharacters = 0;
   const context = {};
   // Small batches keep the typed supplier choices below the proxy's request limit.
   for (let start = 0; start < lines.length;) {
-    let batch = lines.slice(start, start + 8);
-    let request = buildTagRequest(lines, batch, { ...context });
-    while (JSON.stringify({ model: 'jev-latest', ...request }).length > 59_000 && batch.length > 1) {
-      batch = batch.slice(0, -1);
-      request = buildTagRequest(lines, batch, { ...context });
+    let span = lines.slice(start, start + 8);
+    let batch = span.filter(line => !answers[`tag_kind_${line.id}`]);
+    let request = batch.length ? buildTagRequest(lines, batch, { ...context }) : null;
+    while (request && JSON.stringify({ model: 'jev-latest', ...request }).length > 59_000 && span.length > 1) {
+      span = span.slice(0, -1);
+      batch = span.filter(line => !answers[`tag_kind_${line.id}`]);
+      request = batch.length ? buildTagRequest(lines, batch, { ...context }) : null;
     }
-    if (JSON.stringify({ model: 'jev-latest', ...request }).length > 59_000) {
+    if (request && JSON.stringify({ model: 'jev-latest', ...request }).length > 59_000) {
       throw new Error(`Source line ${batch[0].number} is too large for one request. Add a line break within that line and retry.`);
     }
-    const received = await call(request);
-    for (const line of batch) {
-      const kind = decision(received?.[`tag_kind_${line.id}`], KINDS);
-      const supplier = decision(received?.[`tag_supplier_${line.id}`], SUPPLIERS);
+    if (request) {
+      Object.assign(answers, await call(request));
+      requests++; jevLines += batch.length; requestCharacters += JSON.stringify(request).length;
+    }
+    for (const line of span) {
+      const kind = decision(answers[`tag_kind_${line.id}`], KINDS);
+      const supplier = decision(answers[`tag_supplier_${line.id}`], SUPPLIERS);
       if (kind.choice === 'supplier') {
         context.supplier_heading = line.text;
         // A new uncertain heading must clear the preceding supplier, not inherit it.
@@ -108,11 +157,10 @@ export async function tagWithJev(raw, call, onProgress = () => {}) {
       if (line.text.length < 200 && /\b(offers|exclusives?|public|promotions)\b/i.test(line.text) && !/[\d$%]/.test(line.text)) context.section_heading = line.text;
       context.previous_line = { ...line, kind: kind.choice, supplier: supplier.confidence >= .8 ? SUPPLIERS[supplier.choice] : 'unknown' };
     }
-    Object.assign(answers, received);
-    start += batch.length;
-    onProgress(start, lines.length);
+    start += span.length;
+    onProgress(start, lines.length, { localLines, jevLines, requests });
   }
-  return { ...assembleTagResult(lines, answers), answers };
+  return { ...assembleTagResult(lines, answers), answers, stats: { totalLines: lines.length, localLines, jevLines, requests, requestCharacters } };
 }
 
 export function feedbackBlock({ raw, result, corrected, notes, rating, error }) {
@@ -125,6 +173,7 @@ export function feedbackBlock({ raw, result, corrected, notes, rating, error }) 
     correctedOutput: corrected,
     notes,
     error: error || null,
+    processing: result?.stats ?? null,
     decisions: result?.decisions ?? [],
     answers: result?.answers ?? {},
   }, null, 2);
