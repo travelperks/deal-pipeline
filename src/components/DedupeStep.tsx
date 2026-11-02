@@ -106,14 +106,15 @@ export default function DedupeStep({ session, onSessionChange, onComplete, showT
   }, [frozen, lastRun, decisions]);
 
   const categorized = useMemo(() => (results ? categorizeDedupeResults(results) : null), [results]);
-  const jevDown = !!results && results.some(r => r.meta?.candidates?.length) && results.every(r => !r.meta?.candidates?.length || r.meta?.jevError);
+  const requestedJev = results?.filter(r => r.meta?.candidates?.length && !r.meta?.jevSkipped) || [];
+  const jevDown = requestedJev.length > 0 && requestedJev.every(r => r.meta?.jevError);
 
   // Every call Jev made against a real website deal, split into the few it is
   // unsure about (cards) and the confident rest (optional skim list).
   const { unsure, sure } = useMemo(() => {
     if (!categorized) return { unsure: [], sure: [] };
     const calls = [...categorized.update, ...categorized.onSite, ...categorized.added]
-      .filter(r => r.meta?.candidates?.length)
+      .filter(r => r.meta?.candidates?.length && !r.meta?.jevSkipped)
       .sort((a, b) => (a.meta?.jevError ? -1 : a.meta?.confidence ?? 0) - (b.meta?.jevError ? -1 : b.meta?.confidence ?? 0) || a.hq.id - b.hq.id);
     // A row the operator already decided stays where it was first sorted.
     const isUnsure = (r) => (r.meta?.reviewed ? !!decisions[r.hq.id]?.wasUnsure : needsReview(r));

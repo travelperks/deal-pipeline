@@ -141,7 +141,7 @@ export function combineJevAnswer(hq, candidates, answers) {
 /** Calls the operator needs to look at: Jev unsure, Jev unavailable. Everything else is skim-only. */
 export const REVIEW_BELOW = 0.8;
 export function needsReview(row) {
-  if (!row.meta?.candidates?.length) return false;
+  if (!row.meta?.candidates?.length || row.meta?.jevSkipped) return false;
   return !!row.meta.jevError || (row.meta.confidence ?? 0) < REVIEW_BELOW;
 }
 
@@ -198,17 +198,22 @@ export async function compareWithJev(hqDeals, websiteDeals, call, { today = new 
     }
     onProgress(++done, hqDeals.length);
   });
-  return { answers, results: applyJevAnswers(ruleResults, websiteDeals, answers) };
+  return { answers, results: applyJevAnswers(ruleResults, websiteDeals, answers, today) };
 }
 
 /** Re-applies stored Jev answers to rule-based results (no network). */
-export function applyJevAnswers(ruleResults, websiteDeals, answers) {
+export function applyJevAnswers(ruleResults, websiteDeals, answers, today = new Date()) {
   const byFamily = groupByFamily(websiteDeals);
   return ruleResults.map((result) => {
     const candidates = candidatesFor(result.hq, byFamily[result.hq.vendorFamily] || []);
     if (!candidates.length) return { hq: result.hq, web: null, meta: { verdict: 'new', changes: [], candidates: [], ranked: [] } };
     const got = answers[result.hq.id];
     if (!validAnswer(got)) {
+      if (sameDay(result.hq.end, today)) {
+        // The initial batch deliberately skips these. Already-live ones remain
+        // in the summary, so they must not masquerade as failed Jev requests.
+        return { ...result, meta: { ...result.meta, source: 'rules', jevSkipped: 'ending-today', candidates, ranked: [] } };
+      }
       return { ...result, meta: { ...result.meta, jevError: true, candidates, ranked: candidates.map(web => ({ web, p: null })) } };
     }
     return combineJevAnswer(result.hq, candidates, got);

@@ -110,6 +110,16 @@ const endsToday = (await compareWithJev(parseHQ('v\tCunard\nd\tUp to $250 OBC: E
 assert.equal(askedEndingToday, 0, 'Deals ending today are not sent to Jev');
 assert.equal(categorizeDedupeResults([endsToday], { today }).excluded.length, 1);
 
+// Already-live offers ending today remain in the result, but Jev was deliberately
+// skipped. They are neither failed requests nor uncertainty for the operator.
+resetIds();
+const todayLive = (await compareWithJev(parseHQ('v\tCunard\nd\tUp to $250 OBC: Ends 10/13/2026'), site('Cunard', [['Up to $250 OBC', '2026-10-13T08:00:00Z']]), async () => { throw new Error('Ending-today offer must not be requested'); }, { today })).results[0];
+assert.equal(todayLive.meta.verdict, 'on-site');
+assert.equal(todayLive.meta.jevError, undefined, 'An intentionally skipped offer is not a Jev outage');
+assert.equal(todayLive.meta.jevSkipped, 'ending-today');
+assert.equal(needsReview(todayLive), false);
+assert.equal(categorizeDedupeResults([todayLive], { today }).onSite.length, 1);
+
 // Ongoing vs no end date is the same thing: open-ended, and live when all else agrees.
 const open = await run('EXCLUSIVE Covert Fares: Ongoing', [['EXCLUSIVE: Secret Rates – Unveil the Luxury!']],
   { status: choice('update', 0.6, { live: 0.4, update: 0.6, new: 0 }), match: choice('w1', 0.99, { w1: 0.99, none: 0.01 }) }, 'ed', 'Seabourn');
