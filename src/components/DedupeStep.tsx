@@ -4,7 +4,7 @@ import {
   categorizeDedupeResults, exportUnmatched,
   MATCHER_VERSION,
 } from '../logic/dedupe.js';
-import { compareWithJev, applyJevAnswers, applyDecisions, reconsiderWithJev, needsReview } from '../logic/jev.js';
+import { compareWithJev, applyJevAnswers, applyDecisions, reconsiderWithJev, needsReview, pendingJevDeals } from '../logic/jev.js';
 import { validateWebsiteExport } from '../logic/dealCoreClient';
 
 function parseWebsiteRows(text) {
@@ -18,8 +18,8 @@ function plural(n, word) {
 
 // One Jev request through the server-side proxy; the key never reaches here.
 async function callJev(body) {
-  const response = await fetch('/api/jev', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  if (!response.ok) throw new Error(`Jev ${response.status}`);
+  const response = await fetch('/api/jev', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(90_000) });
+  if (!response.ok) throw Object.assign(new Error(`Jev ${response.status}`), { status: response.status });
   return (await response.json()).answers;
 }
 
@@ -37,6 +37,7 @@ const CALL = {
  */
 export default function DedupeStep({ session, onSessionChange, onComplete, showToast }) {
   const fileRef = useRef(null);
+  const jevJob = useRef(null);
   const [importError, setImportError] = useState('');
   const [dragging, setDragging] = useState(false);
   const [progress, setProgress] = useState(null);
@@ -74,12 +75,23 @@ export default function DedupeStep({ session, onSessionChange, onComplete, showT
   }, [canCompare, current, hqText, websiteRows, updateSession]);
 
   useEffect(() => {
-    if (!frozen || lastRun.jev) return;
+    if (!frozen) return;
+    let job = jevJob.current;
+    const sameRun = job && (job.run === lastRun || !!lastRun.jev) && job.hqText === lastRun.hqText && job.websiteRows === lastRun.websiteRows && job.matcherVersion === lastRun.matcherVersion;
+    if (sameRun && job.settled) return;
+    if (!sameRun && lastRun.jev && !pendingJevDeals(frozen.hq, frozen.web, lastRun.jev).length) return;
     let cancelled = false;
     setProgress({ done: 0, total: frozen.hq.length });
-    compareWithJev(frozen.hq, frozen.web, callJev, {
-      onProgress: (done, total) => { if (!cancelled) setProgress({ done, total }); },
-    }).then(({ answers }) => {
+    if (!sameRun) {
+      job = { run: lastRun, hqText: lastRun.hqText, websiteRows: lastRun.websiteRows, matcherVersion: lastRun.matcherVersion, settled: false, onProgress: null, promise: null };
+      jevJob.current = job;
+      job.promise = compareWithJev(frozen.hq, frozen.web, callJev, {
+        cache: lastRun.jev || {},
+        onProgress: (done, total) => job.onProgress?.(done, total),
+      }).then(result => { job.settled = true; return result; });
+    }
+    job.onProgress = (done, total) => { if (!cancelled) setProgress({ done, total }); };
+    job.promise.then(({ answers }) => {
       if (cancelled) return;
       setProgress(null);
       updateSession((prev) => (prev.lastRun === lastRun ? { ...prev, lastRun: { ...lastRun, jev: answers } } : prev));

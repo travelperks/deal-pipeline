@@ -158,6 +158,15 @@ function groupByFamily(websiteDeals) {
   return byFamily;
 }
 
+function validAnswer(answer) {
+  return ['new', 'update', 'live'].includes(answer?.status?.choice) && /^(none|w\d+)$/.test(answer?.match?.choice || '');
+}
+
+export function pendingJevDeals(hqDeals, websiteDeals, cache = {}, today = new Date()) {
+  const byFamily = groupByFamily(websiteDeals);
+  return hqDeals.filter(hq => candidatesFor(hq, byFamily[hq.vendorFamily] || []).length && !sameDay(hq.end, today) && !validAnswer(cache?.[hq.id]));
+}
+
 /**
  * Compares every incoming deal with Jev. `call(body)` sends one request and
  * resolves to Jev's `answers`. Only deals with a same-exclusivity candidate
@@ -165,18 +174,27 @@ function groupByFamily(websiteDeals) {
  * not answer keep the rule-based verdict, marked `jevError`. `cache` maps
  * hq id → answers already received.
  */
-export async function compareWithJev(hqDeals, websiteDeals, call, { today = new Date(), cache = {}, concurrency = 6, onProgress = (_done, _total) => {} } = {}) {
+export async function compareWithJev(hqDeals, websiteDeals, call, { today = new Date(), cache = {}, concurrency = 2, retryDelayMs = 400, onProgress = (_done, _total) => {} } = {}) {
   const ruleResults = runFullMatch(hqDeals, websiteDeals);
   const byFamily = groupByFamily(websiteDeals);
   const answers = { ...cache };
-  const todo = hqDeals.filter(hq => candidatesFor(hq, byFamily[hq.vendorFamily] || []).length && !sameDay(hq.end, today) && !answers[hq.id]);
+  const todo = pendingJevDeals(hqDeals, websiteDeals, answers, today);
   let done = hqDeals.length - todo.length;
   onProgress(done, hqDeals.length);
   await pool(todo, concurrency, async (hq) => {
-    try {
-      answers[hq.id] = await call(buildJevRequest(hq, candidatesFor(hq, byFamily[hq.vendorFamily]), today));
-    } catch {
-      // Left unanswered: the rule-based verdict stands for this deal.
+    delete answers[hq.id];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const answer = await call(buildJevRequest(hq, candidatesFor(hq, byFamily[hq.vendorFamily]), today));
+        if (!validAnswer(answer)) throw new Error('Incomplete Jev answer');
+        answers[hq.id] = answer;
+        break;
+      } catch (error) {
+        // Retry only an unanswered request, never a successful paid decision.
+        const permanent = error?.status >= 400 && error.status < 500 && ![408, 429].includes(error.status);
+        if (attempt || permanent) break;
+        await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+      }
     }
     onProgress(++done, hqDeals.length);
   });
@@ -190,7 +208,7 @@ export function applyJevAnswers(ruleResults, websiteDeals, answers) {
     const candidates = candidatesFor(result.hq, byFamily[result.hq.vendorFamily] || []);
     if (!candidates.length) return { hq: result.hq, web: null, meta: { verdict: 'new', changes: [], candidates: [], ranked: [] } };
     const got = answers[result.hq.id];
-    if (!got?.status || !got?.match) {
+    if (!validAnswer(got)) {
       return { ...result, meta: { ...result.meta, jevError: true, candidates, ranked: candidates.map(web => ({ web, p: null })) } };
     }
     return combineJevAnswer(result.hq, candidates, got);

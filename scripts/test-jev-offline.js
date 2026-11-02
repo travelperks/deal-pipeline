@@ -70,6 +70,33 @@ const failed = (await compareWithJev(hq, site('Cunard', [['Receive Up to $350 On
 assert.equal(failed.meta.jevError, true);
 assert.equal(failed.meta.verdict, 'update');
 
+// A temporary first-request failure must recover without an operator retry.
+let attempts = 0;
+const recovered = await compareWithJev(hq, site('Cunard', [['Receive Up to $350 Onboard Credit']]), async () => {
+  if (++attempts === 1) throw new Error('temporary network failure');
+  return { status: choice('update'), match: choice('w1') };
+}, { today, retryDelayMs: 0 });
+assert.equal(recovered.results[0].meta.jevError, undefined, 'Initial transient failures should retry automatically');
+assert.equal(attempts, 2);
+
+// An incomplete saved answer is retried, while a successful saved answer is reused.
+let recoveredCacheCalls = 0;
+const partial = await compareWithJev(hq, site('Cunard', [['Receive Up to $350 Onboard Credit']]), async () => {
+  recoveredCacheCalls++;
+  return { status: choice('update'), match: choice('w1') };
+}, { today, cache: { [hq[0].id]: { status: choice('update') } }, retryDelayMs: 0 });
+assert.equal(recoveredCacheCalls, 1);
+assert.equal(partial.results[0].meta.jevError, undefined);
+let cachedRequests = 0;
+const cached = await compareWithJev(hq, site('Cunard', [['Receive Up to $350 Onboard Credit']]), async () => { cachedRequests++; throw new Error('Unexpected request'); }, { today, cache: partial.answers });
+assert.equal(cachedRequests, 0, 'Successful cached answers must not be requested again');
+assert.equal(cached.results[0].meta.jevError, undefined);
+let permanentRequests = 0;
+await compareWithJev(hq, site('Cunard', [['Receive Up to $350 Onboard Credit']]), async () => {
+  permanentRequests++; throw Object.assign(new Error('Forbidden'), { status: 403 });
+}, { today, retryDelayMs: 0 });
+assert.equal(permanentRequests, 1, 'Permanent request errors must not be retried');
+
 // A supplier with nothing on the site is never sent to Jev.
 let calls = 0;
 resetIds();
