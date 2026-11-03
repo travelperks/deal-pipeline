@@ -330,7 +330,7 @@ export default function CopywritingStep({ session, onSessionChange, showToast })
           return (
             <section key={group.vendorIndex || vIdx} className="supplier" aria-label={group.name}>
               <h2 className="supplier-name">
-                <a href={`https://travelperks.com/admin/entries/deals?search=${encodeURIComponent(group.name)}`} target="travelperks-admin" referrerPolicy="no-referrer">{group.name}<span className="visually-hidden"> (opens admin search)</span></a>
+                <a href={`https://travelperks.com/admin/content/entries/deals?source=section%3A8d00284b-fc9e-4b3e-8f03-ab319af6f0db&search=${encodeURIComponent(group.name)}`} target="travelperks-admin" referrerPolicy="no-referrer">{group.name}<span className="visually-hidden"> (opens admin search)</span></a>
               </h2>
               {rows.map((row) => <DealRow
                 key={row.key}
