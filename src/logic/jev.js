@@ -6,7 +6,7 @@
 // ending-today exclusion, year-typo fixes, and the live-vs-update term check.
 // =============================================================================
 
-import { compareMarkers, dateFmt, runFullMatch, sameDay } from './dedupe.js';
+import { compareMarkers, dateFmt, runFullMatch, sameDay, exportUnmatched } from './dedupe.js';
 
 /**
  * Every rule the project knows about "is this the same deal?", compiled from
@@ -100,6 +100,25 @@ export function buildJevRequest(hq, candidates, today = new Date(), note = '') {
 
 const FIGURE_KEYS = ['dollars', 'percents', 'nights', 'expiry'];
 
+// Matching numbers alone do not prove identity. They do justify operator review
+// when Jev says "new", especially if the only barrier is an exclusivity label.
+function matchingTerms(hq, websiteDeals) {
+  return websiteDeals.filter(web => {
+    const pair = compareMarkers(hq, web);
+    const sharedFigure = ['dollars', 'percents'].some(key => hq.markers[key]?.size && web.markers[key]?.size && pair.checks.find(c => c.key === key)?.status === 'same');
+    const sameEnd = hq.end && web.expiryDate ? sameDay(hq.end, web.expiryDate) : !hq.end && !web.expiryDate;
+    return sharedFigure && sameEnd && pair.checks.find(c => c.key === 'type')?.status !== 'different' && FIGURE_KEYS.every(key => !pair.differences.includes(key));
+  });
+}
+
+function requireReview(result, candidates, reason) {
+  const existing = result.meta.ranked || [];
+  return { ...result, meta: { ...result.meta, reviewReason: reason, reviewCandidates: candidates, ranked: [
+    ...candidates.map(web => existing.find(row => row.web === web) || { web, p: null }),
+    ...existing.filter(row => !candidates.includes(row.web)),
+  ] } };
+}
+
 /**
  * Turns Jev's two answers into a comparison result. Jev decides whether the
  * deal is on the site and which entry it is; when Jev says update/live but
@@ -123,7 +142,9 @@ export function combineJevAnswer(hq, candidates, answers) {
   if (status.choice === 'new' || target < 0) {
     // Sure it is new = sure it is new AND no website deal looks like a match.
     const confidence = Math.min(pNew, 1 - (ranked[0]?.p ?? 0));
-    return { hq, web: null, meta: { ...base, verdict: 'new', confidence, changes: [] } };
+    const result = { hq, web: null, meta: { ...base, verdict: 'new', confidence, changes: [] } };
+    const conflicts = matchingTerms(hq, candidates);
+    return conflicts.length ? requireReview(result, conflicts, 'matching-terms') : result;
   }
   const web = candidates[target];
   const pair = compareMarkers(hq, web);
@@ -141,7 +162,9 @@ export function combineJevAnswer(hq, candidates, answers) {
 /** Calls the operator needs to look at: Jev unsure, Jev unavailable. Everything else is skim-only. */
 export const REVIEW_BELOW = 0.8;
 export function needsReview(row) {
-  if (!row.meta?.candidates?.length || row.meta?.jevSkipped) return false;
+  if (row.meta?.jevSkipped) return false;
+  if (row.meta?.reviewReason) return true;
+  if (!row.meta?.candidates?.length) return false;
   return !!row.meta.jevError || (row.meta.confidence ?? 0) < REVIEW_BELOW;
 }
 
@@ -205,8 +228,13 @@ export async function compareWithJev(hqDeals, websiteDeals, call, { today = new 
 export function applyJevAnswers(ruleResults, websiteDeals, answers, today = new Date()) {
   const byFamily = groupByFamily(websiteDeals);
   return ruleResults.map((result) => {
-    const candidates = candidatesFor(result.hq, byFamily[result.hq.vendorFamily] || []);
-    if (!candidates.length) return { hq: result.hq, web: null, meta: { verdict: 'new', changes: [], candidates: [], ranked: [] } };
+    const family = byFamily[result.hq.vendorFamily] || [];
+    const candidates = candidatesFor(result.hq, family);
+    const crossExclusive = matchingTerms(result.hq, family.filter(web => !!web.markers.exclusive !== !!result.hq.markers.exclusive));
+    if (!candidates.length) {
+      const unmatched = { hq: result.hq, web: null, meta: { verdict: 'new', changes: [], candidates: [], ranked: [] } };
+      return crossExclusive.length && !sameDay(result.hq.end, today) ? requireReview(unmatched, crossExclusive, 'exclusivity-mismatch') : unmatched;
+    }
     const got = answers[result.hq.id];
     if (!validAnswer(got)) {
       if (sameDay(result.hq.end, today)) {
@@ -216,7 +244,8 @@ export function applyJevAnswers(ruleResults, websiteDeals, answers, today = new 
       }
       return { ...result, meta: { ...result.meta, jevError: true, candidates, ranked: candidates.map(web => ({ web, p: null })) } };
     }
-    return combineJevAnswer(result.hq, candidates, got);
+    const combined = combineJevAnswer(result.hq, candidates, got);
+    return combined.meta.verdict === 'new' && crossExclusive.length ? requireReview(combined, crossExclusive, 'exclusivity-mismatch') : combined;
   });
 }
 
@@ -245,4 +274,19 @@ export function applyDecisions(results, decisions, websiteDeals) {
     const pair = web ? compareMarkers(r.hq, web) : { changes: [] };
     return { ...r, web, meta: { ...r.meta, ...pair, verdict: d.verdict, reviewed: true } };
   });
+}
+
+/** The Publish boundary: every uncertain call must have an explicit decision. */
+export function buildPublishHandoff(categorized) {
+  const all = [...categorized.update, ...categorized.added, ...categorized.onSite];
+  if (all.some(row => !row.meta?.reviewed && needsReview(row))) return null;
+  const rows = [...categorized.update, ...categorized.added];
+  if (!rows.length) return null;
+  return {
+    text: exportUnmatched(rows.map(row => row.hq)),
+    actions: [
+      ...categorized.update.map(row => ({ vendor: row.hq.vendor, text: row.hq.text, action: 'update', websiteTitle: row.web?.raw?.title || '' })),
+      ...categorized.added.map(row => ({ vendor: row.hq.vendor, text: row.hq.text, action: 'new', websiteTitle: '' })),
+    ],
+  };
 }

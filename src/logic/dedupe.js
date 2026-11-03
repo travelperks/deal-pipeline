@@ -411,7 +411,7 @@ function attachCandidateRankings(meta, matrixRow, webGroup) {
 }
 
 // Saved decisions belong to the candidate assignments produced by this version.
-export const MATCHER_VERSION = 7;
+export const MATCHER_VERSION = 8;
 
 // --- Assignment with an independent no-match option for every incoming deal ---
 
@@ -539,6 +539,7 @@ function looksLikeDealContent(value) {
 export function parseHQ(text) {
   const lines = (text || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
   const items = [];
+  const seen = new Set();
   let currentVendor = null;
   let currentVendorResolution = null;
 
@@ -569,6 +570,9 @@ export function parseHQ(text) {
         ? content.replace(new RegExp(`/${dates.yearCorrection.from}(?!\\d)`), `/${dates.yearCorrection.to}`)
         : content;
       const markers = extractMarkers(text, { exclusive: type === 'exclusive' });
+      const identity = dealIdentity(currentVendor, type, text);
+      if (seen.has(identity)) continue;
+      seen.add(identity);
       items.push({
         id: ++nextId,
         type,
@@ -715,9 +719,17 @@ export function categorizeDedupeResults(
  * Serializes reviewed unmatched HQ records back to canonical tagged text for
  * the Copy step, preserving exclusivity and grouping suppliers alphabetically.
  */
+function dealIdentity(vendor, type, text) {
+  return JSON.stringify([vendor, type, text].map(value => String(value || '').trim().replace(/\s+/g, ' ').toLowerCase()));
+}
+
 export function exportUnmatched(deals) {
   const grouped = {};
+  const seen = new Set();
   deals.forEach(d => {
+    const identity = dealIdentity(d.vendor, d.type, d.text);
+    if (seen.has(identity)) return;
+    seen.add(identity);
     if (!grouped[d.vendor]) grouped[d.vendor] = [];
     grouped[d.vendor].push(d);
   });

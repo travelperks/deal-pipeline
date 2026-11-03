@@ -1,10 +1,10 @@
 import React, { useMemo, useCallback, useEffect, useRef, useState } from 'react';
 import {
   parseHQ, resetIds, ingestWebsiteJSON, runFullMatch, compareMarkers,
-  categorizeDedupeResults, exportUnmatched,
+  categorizeDedupeResults,
   MATCHER_VERSION,
 } from '../logic/dedupe.js';
-import { compareWithJev, applyJevAnswers, applyDecisions, reconsiderWithJev, needsReview, pendingJevDeals } from '../logic/jev.js';
+import { compareWithJev, applyJevAnswers, applyDecisions, reconsiderWithJev, needsReview, pendingJevDeals, buildPublishHandoff } from '../logic/jev.js';
 import { validateWebsiteExport } from '../logic/dealCoreClient';
 
 function parseWebsiteRows(text) {
@@ -114,7 +114,7 @@ export default function DedupeStep({ session, onSessionChange, onComplete, showT
   const { unsure, sure } = useMemo(() => {
     if (!categorized) return { unsure: [], sure: [] };
     const calls = [...categorized.update, ...categorized.onSite, ...categorized.added]
-      .filter(r => r.meta?.candidates?.length && !r.meta?.jevSkipped)
+      .filter(r => (r.meta?.candidates?.length || r.meta?.reviewCandidates?.length) && !r.meta?.jevSkipped)
       .sort((a, b) => (a.meta?.jevError ? -1 : a.meta?.confidence ?? 0) - (b.meta?.jevError ? -1 : b.meta?.confidence ?? 0) || a.hq.id - b.hq.id);
     // A row the operator already decided stays where it was first sorted.
     const isUnsure = (r) => (r.meta?.reviewed ? !!decisions[r.hq.id]?.wasUnsure : needsReview(r));
@@ -220,12 +220,9 @@ export default function DedupeStep({ session, onSessionChange, onComplete, showT
   const toPublish = [...categorized.update, ...categorized.added];
   const leftToReview = unsure.filter(r => !decisions[r.hq.id]).length;
   const sendToPublish = () => {
-    if (!toPublish.length) return;
-    // Updates keep the website entry's URL in Publish; new deals get a slug.
-    onComplete(exportUnmatched(toPublish.map(row => row.hq)), [
-      ...categorized.update.map(row => ({ vendor: row.hq.vendor, text: row.hq.text, action: 'update', websiteTitle: row.web?.raw?.title || '' })),
-      ...categorized.added.map(row => ({ vendor: row.hq.vendor, text: row.hq.text, action: 'new', websiteTitle: '' })),
-    ]);
+    const handoff = buildPublishHandoff(categorized);
+    if (!handoff) return;
+    onComplete(handoff.text, handoff.actions);
   };
 
   return (
@@ -240,9 +237,10 @@ export default function DedupeStep({ session, onSessionChange, onComplete, showT
       {jevDown && <p className="calm-sub calm-error">Jev isn't connected, so these are the built-in rules' calls.</p>}
       <div className="calm-actions">
         {leftToReview > 0 && <button className="calm-go" onClick={() => startReview()}>Check {leftToReview === 1 ? 'the 1 deal' : `the ${leftToReview} deals`} Jev isn't sure about →</button>}
-        {!!toPublish.length && <button className={leftToReview > 0 ? 'calm-second' : 'calm-go'} onClick={sendToPublish}>Continue to Publish →</button>}
+        {!!toPublish.length && <button className={leftToReview > 0 ? 'calm-second' : 'calm-go'} disabled={leftToReview > 0} onClick={sendToPublish}>Continue to Publish →</button>}
       </div>
       <p className="calm-note">
+        {leftToReview > 0 && 'Review the uncertain calls before continuing to Publish. '}
         {leftToReview === 0 && unsure.length > 0 ? 'Every unsure call is checked. ' : ''}
         {sure.length > 0 && <>Jev is sure about {sure.length} more. <button onClick={() => setSkimming(true)}>skim them</button></>}
       </p>
@@ -314,7 +312,7 @@ function ReviewCard({ r, websiteDeals, position, total, onDecide, onBack, onClos
     if (next >= 0) setAt(next); else onDecide(r, 'new', null);
   }, [r, web, index, sameAs, onDecide, ranked, at, start]);
   const reconsider = useCallback(async () => {
-    if (asking) return;
+    if (asking || r.meta?.reviewReason === 'exclusivity-mismatch') return;
     setAsking(true);
     try { await onReconsider(r); } finally { setAsking(false); }
   }, [asking, onReconsider, r]);
@@ -351,7 +349,7 @@ function ReviewCard({ r, websiteDeals, position, total, onDecide, onBack, onClos
       </div>
       <div className="review-side is-site">
         <span className="review-label">
-          {web ? `${isJevPick ? 'On the website — Jev\'s pick' : jevVerdict === 'new' && at === 0 ? 'Closest on the website' : 'On the website'}${shown.p != null ? ` · Jev ${Math.round(shown.p * 100)}% match` : ''}` : 'On the website'}
+          {web ? `${r.meta?.reviewReason && !r.web ? 'Possible existing website deal' : isJevPick ? 'On the website — Jev\'s pick' : jevVerdict === 'new' && at === 0 ? 'Closest on the website' : 'On the website'}${shown.p != null ? ` · Jev ${Math.round(shown.p * 100)}% match` : ''}` : 'On the website'}
         </span>
         {web ? <>
           <p className="review-text">{web.raw?.title}</p>
@@ -361,17 +359,21 @@ function ReviewCard({ r, websiteDeals, position, total, onDecide, onBack, onClos
     </div>
     <FactsTable hq={r.hq} web={web} />
     <p className="review-call">
-      {onAlt
+      {r.meta?.reviewReason === 'exclusivity-mismatch'
+        ? <>Possible existing deal: the terms match, but one version is marked exclusive. Confirm whether they are the same offer.</>
+        : r.meta?.reviewReason === 'matching-terms'
+        ? <>Possible existing deal: the parsed terms match an offer already on the website. Confirm whether any work is needed.</>
+        : onAlt
         ? <>Is it this one instead?</>
         : <>Jev: <strong>{CALL[jevVerdict]}</strong>{sure !== null ? ` · ${sure}% sure` : ' · Jev unavailable, built-in rules'}{r.meta?.reconsidered ? ' · reconsidered' : ''}</>}
     </p>
     <div className="review-buttons">
-      <button className="is-main" onClick={correct}>{onAlt ? 'Yes, this one' : 'Correct'} <kbd>→</kbd></button>
+      <button className="is-main" onClick={correct}>{r.meta?.reviewReason && !r.web ? 'Keep as separate deal' : onAlt ? 'Yes, this one' : 'Correct'} <kbd>→</kbd></button>
       <button className="is-update" disabled={!web} onClick={() => onDecide(r, 'update', index)}>Same deal, update <kbd>U</kbd></button>
-      <button className="is-wrong" onClick={wrong}>{onAlt ? 'No' : 'Wrong'} <kbd>W</kbd></button>
+      <button className="is-wrong" onClick={r.meta?.reviewReason && !r.web && web ? () => onDecide(r, 'on-site', index) : wrong}>{r.meta?.reviewReason && !r.web && web ? 'Already current' : onAlt ? 'No' : 'Wrong'} <kbd>W</kbd></button>
     </div>
     <p className="review-others">
-      <button onClick={reconsider} disabled={asking}>{asking ? 'asking Jev…' : 'ask Jev again'}</button>
+      {r.meta?.reviewReason !== 'exclusivity-mismatch' && <button onClick={reconsider} disabled={asking}>{asking ? 'asking Jev…' : 'ask Jev again'}</button>}
       {others > 0 && <> · other {r.hq.vendor} deals: {ranked.map((x, i) => i === at ? null : <button key={i} onClick={() => setAt(i)}>{x.web.raw?.title}{x.p != null ? ` (${Math.round(x.p * 100)}%)` : ''}</button>)}</>}
       {others === 0 && web && <> · no other {r.hq.vendor} deals on the site</>}
     </p>

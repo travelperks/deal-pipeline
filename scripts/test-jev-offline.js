@@ -1,7 +1,7 @@
 // Offline checks for how Jev's answers become verdicts (DEC-07). No network.
 import assert from 'node:assert/strict';
 import { parseHQ, resetIds, ingestWebsiteJSON, categorizeDedupeResults } from '../src/logic/dedupe.js';
-import { buildJevRequest, candidatesFor, compareWithJev, reconsiderWithJev, needsReview } from '../src/logic/jev.js';
+import { buildJevRequest, candidatesFor, compareWithJev, reconsiderWithJev, needsReview, applyDecisions } from '../src/logic/jev.js';
 
 const today = new Date(2026, 9, 13);
 const choice = (c, confidence = 0.9, probabilities = {}) => ({ type: 'choice', choice: c, confidence, probabilities });
@@ -11,6 +11,25 @@ async function run(source, web, answers, tag = 'd', vendor = 'Cunard') {
   const hq = parseHQ(`v\t${vendor}\n${tag}\t${source}`);
   return (await compareWithJev(hq, site(vendor, web), async () => answers, { today })).results[0];
 }
+
+resetIds();
+const duplicateInput = parseHQ('v\tCelebrity\nd\tUp to 75% off 2nd Guest: Ends 11/5/2026\nv\tCelebrity Cruises\nd\tUp to 75% off 2nd Guest: Ends 11/5/2026');
+assert.equal(duplicateInput.length, 1, 'Identical incoming offers under supplier aliases must collapse');
+resetIds();
+assert.equal(parseHQ('v\tCelebrity Cruises\nd\tSave 75%\ned\tSave 75%\nd\tSave 70%\nv\tCarnival\nd\tSave 75%').length, 4, 'Different suppliers, exclusivity or terms must remain distinct');
+
+const conflictingNew = await run('EXCLUSIVE Covert 10% Savings (PWD): Ends 11/9/2026', [['EXCLUSIVE: Receive 10% Savings on Your Next Cruise Vacation', '2026-11-09T16:00:00-08:00']], { status: choice('new', .99), match: choice('none', .99) }, 'ed', 'Carnival');
+assert.equal(conflictingNew.meta.reviewReason, 'matching-terms', 'A confident new guess must not bypass conflicting existing terms');
+assert.equal(needsReview(conflictingNew), true);
+const differentTerms = await run('EXCLUSIVE Covert 10% Savings: Ends 11/9/2026', [['EXCLUSIVE: Receive 20% Savings', '2026-11-09T16:00:00-08:00']], { status: choice('new', .99), match: choice('none', .99) }, 'ed', 'Carnival');
+assert.equal(differentTerms.meta.reviewReason, undefined, 'Different terms must not trigger the exact-terms conflict guard');
+
+const exclusivityConflict = await run('Up to $1000 Onboard Credit: Ends 12/31/2026', [['EXCLUSIVE: Receive Up to $1,000 in Onboard Credit for Your Voyage', '2026-12-31T16:00:00-08:00']], {}, 'd', 'Ritz-Carlton Yacht Collection');
+assert.equal(exclusivityConflict.meta.reviewReason, 'exclusivity-mismatch');
+assert.equal(needsReview(exclusivityConflict), true, 'An exclusivity mismatch must not silently become a clear new deal');
+assert.equal(exclusivityConflict.web, null, 'Do not automatically merge public and exclusive offers');
+const confirmedExisting = applyDecisions([exclusivityConflict], { [exclusivityConflict.hq.id]: { verdict: 'on-site', web: 0 } }, site('Ritz-Carlton Yacht Collection', [['EXCLUSIVE: Receive Up to $1,000 in Onboard Credit for Your Voyage', '2026-12-31T16:00:00-08:00']]));
+assert.equal(categorizeDedupeResults(confirmedExisting, { today }).onSite.length, 1, 'Operator confirmation must resolve a suspected existing offer');
 
 // The request carries typed facts and how each candidate compares.
 resetIds();

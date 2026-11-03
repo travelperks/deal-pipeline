@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { buildReviewQueue } from '../src/logic/review.js';
 import { categorizeDedupeResults, exportUnmatched } from '../src/logic/dedupe.js';
+import { buildPublishHandoff, applyDecisions } from '../src/logic/jev.js';
 import { validateDeal } from '../src/logic/copywriting.js';
 
 const today = new Date(2026, 9, 13);
@@ -28,6 +29,16 @@ const payload = exportUnmatched([...queue.update, ...queue.added].map(r => r.hq)
 assert.ok(payload.includes('New offer'));
 assert.ok(!payload.includes('Save 20%'), 'On-site deals never enter the publish payload');
 assert.ok(!payload.includes('Last day'), 'Ending-today deals never enter the publish payload');
+
+const suspicious = { hq: { id: 101, vendor: 'Carnival', type: 'exclusive', text: 'EXCLUSIVE 10% savings' }, web: null, meta: { verdict: 'new', reviewReason: 'matching-terms', candidates: [], reviewCandidates: [{}] } };
+const ready = { hq: { id: 102, vendor: 'Carnival', type: 'deal', text: 'Save 25%' }, web: null, meta: { verdict: 'new', candidates: [] } };
+assert.equal(buildPublishHandoff(categorizeDedupeResults([ready, suspicious], { today })), null, 'A ready deal must not carry an unresolved suspect deal across Publish');
+const approved = applyDecisions([ready, suspicious], { 101: { verdict: 'new' } }, []);
+const handoff = buildPublishHandoff(categorizeDedupeResults(approved, { today }));
+assert.ok(handoff.text.includes('EXCLUSIVE 10% savings'));
+assert.equal(handoff.actions.length, 2);
+const duplicatePayload = exportUnmatched([ready.hq, { ...ready.hq, id: 103 }]);
+assert.equal(duplicatePayload.split('\n').filter(line => line.startsWith('d\t')).length, 1, 'Duplicate offers must not survive the Publish serialization boundary');
 
 const source = { originalText: 'Save 20% on your cruise', isExclusive: false };
 const clean = { headline: 'Save 20% on your cruise', description: 'Enjoy your next cruise for less.' };
