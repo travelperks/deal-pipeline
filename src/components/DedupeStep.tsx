@@ -1,10 +1,10 @@
-import React, { useMemo, useCallback, useEffect, useRef, useState } from 'react';
+import React, { useMemo, useCallback, useRef, useState } from 'react';
 import {
-  parseHQ, resetIds, ingestWebsiteJSON, runFullMatch, compareMarkers,
-  categorizeDedupeResults,
+  parseHQ, resetIds, ingestWebsiteJSON, runFullMatch,
+  categorizeDedupeResults, exportUnmatched, sameDay, dateFmt,
   MATCHER_VERSION,
 } from '../logic/dedupe.js';
-import { compareWithJev, applyJevAnswers, applyDecisions, reconsiderWithJev, needsReview, pendingJevDeals, buildPublishHandoff } from '../logic/jev.js';
+import { buildReviewQueue } from '../logic/review.js';
 import { validateWebsiteExport } from '../logic/dealCoreClient';
 
 function parseWebsiteRows(text) {
@@ -12,38 +12,27 @@ function parseWebsiteRows(text) {
   return Array.isArray(data) ? data : data.entries || data.data || [];
 }
 
-function plural(n, word) {
-  return `${n} ${word}${n === 1 ? '' : 's'}`;
-}
-
-// One Jev request through the server-side proxy; the key never reaches here.
-async function callJev(body) {
-  const response = await fetch('/api/jev', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(90_000) });
-  if (!response.ok) throw Object.assign(new Error(`Jev ${response.status}`), { status: response.status });
-  return (await response.json()).answers;
-}
-
-const CALL = {
-  update: 'Same deal — update it',
-  'on-site': 'Already live — nothing to do',
-  new: 'New deal — not on the site',
-};
-
 /**
- * Compares the tagged batch with the website export using Jev (DEC-07) and
- * lands on one sentence and one button. Jev's calls can be reviewed one card
- * at a time, least sure first; the operator's call always wins. The whole
- * step accepts a dropped website export, and comparison starts by itself.
+ * Orchestrates website-export validation, supplier-scoped marker matching, and
+ * the operator's two-way sort: rows identical to the website are pre-checked
+ * for bulk confirmation, everything else is the work list handed to
+ * Copywriting. Matcher inputs are frozen into `lastRun`.
  */
 export default function DedupeStep({ session, onSessionChange, onComplete, showToast }) {
   const fileRef = useRef(null);
-  const jevJob = useRef(null);
   const [importError, setImportError] = useState('');
-  const [dragging, setDragging] = useState(false);
-  const [progress, setProgress] = useState(null);
-  const [reviewAt, setReviewAt] = useState(-1);
+  const [search, setSearch] = useState('');
+  const [lastDecision, setLastDecision] = useState(null);
   const decisions = session.decisions || {};
-  const { hqText, websiteRows, lastRun } = session;
+  const activeView = ['work', 'identical'].includes(session.viewFilter) ? session.viewFilter : 'work';
+
+  const {
+    hqText,
+    websiteRows,
+    lastRun,
+    supplierFilter,
+    restrictToday,
+  } = session;
 
   const updateSession = useCallback((patch) => {
     onSessionChange((prev) => (
@@ -57,379 +46,256 @@ export default function DedupeStep({ session, onSessionChange, onComplete, showT
     return parseHQ(hqText);
   }, [hqText]);
 
-  // Changing either input clears lastRun, so a run of this version is current.
-  const current = !!lastRun && lastRun.matcherVersion === MATCHER_VERSION && lastRun.hqText === hqText;
-  const canCompare = hqDeals.length > 0 && websiteRows.length > 0;
-
-  const frozen = useMemo(() => {
-    if (!current) return null;
-    resetIds();
-    return { hq: parseHQ(lastRun.hqText), web: ingestWebsiteJSON(lastRun.websiteRows) };
-  }, [current, lastRun]);
-
-  // Start a comparison as soon as both inputs exist; ask Jev once per run.
-  useEffect(() => {
-    if (!canCompare || current) return;
-    updateSession({ lastRun: { matcherVersion: MATCHER_VERSION, hqText, websiteRows, jev: null }, decisions: {} });
-    setReviewAt(-1);
-  }, [canCompare, current, hqText, websiteRows, updateSession]);
-
-  useEffect(() => {
-    if (!frozen) return;
-    let job = jevJob.current;
-    const sameRun = job && (job.run === lastRun || !!lastRun.jev) && job.hqText === lastRun.hqText && job.websiteRows === lastRun.websiteRows && job.matcherVersion === lastRun.matcherVersion;
-    if (sameRun && job.settled) return;
-    if (!sameRun && lastRun.jev && !pendingJevDeals(frozen.hq, frozen.web, lastRun.jev).length) return;
-    let cancelled = false;
-    setProgress({ done: 0, total: frozen.hq.length });
-    if (!sameRun) {
-      job = { run: lastRun, hqText: lastRun.hqText, websiteRows: lastRun.websiteRows, matcherVersion: lastRun.matcherVersion, settled: false, onProgress: null, promise: null };
-      jevJob.current = job;
-      job.promise = compareWithJev(frozen.hq, frozen.web, callJev, {
-        cache: lastRun.jev || {},
-        onProgress: (done, total) => job.onProgress?.(done, total),
-      }).then(result => { job.settled = true; return result; });
-    }
-    job.onProgress = (done, total) => { if (!cancelled) setProgress({ done, total }); };
-    job.promise.then(({ answers }) => {
-      if (cancelled) return;
-      setProgress(null);
-      updateSession((prev) => (prev.lastRun === lastRun ? { ...prev, lastRun: { ...lastRun, jev: answers } } : prev));
-    });
-    return () => { cancelled = true; };
-  }, [frozen, lastRun, updateSession]);
+  const websiteDeals = useMemo(() => ingestWebsiteJSON(websiteRows), [websiteRows]);
+  const webSuppliers = useMemo(
+    () => [...new Set(websiteDeals.map((deal) => deal.supplier))].sort(),
+    [websiteDeals],
+  );
 
   const results = useMemo(() => {
-    if (!frozen || !lastRun.jev) return null;
-    const jevResults = applyJevAnswers(runFullMatch(frozen.hq, frozen.web), frozen.web, lastRun.jev);
-    return applyDecisions(jevResults, decisions, frozen.web);
-  }, [frozen, lastRun, decisions]);
+    if (!lastRun) return null;
+    if (lastRun.matcherVersion !== MATCHER_VERSION) return null;
+    if (!lastRun.hqText.trim() || !lastRun.websiteRows.length) return null;
+    resetIds();
+    const lastRunDeals = parseHQ(lastRun.hqText);
+    const lastRunWebsiteDeals = ingestWebsiteJSON(lastRun.websiteRows);
+    return runFullMatch(lastRunDeals, lastRunWebsiteDeals, {
+      filterSupplier: lastRun.supplierFilter,
+    });
+  }, [lastRun]);
 
-  const categorized = useMemo(() => (results ? categorizeDedupeResults(results) : null), [results]);
-  const requestedJev = results?.filter(r => r.meta?.candidates?.length && !r.meta?.jevSkipped) || [];
-  const jevDown = requestedJev.length > 0 && requestedJev.every(r => r.meta?.jevError);
+  const categorized = useMemo(() => {
+    if (!results) return null;
+    return categorizeDedupeResults(results, {
+      excludeEndingToday: restrictToday,
+    });
+  }, [results, restrictToday]);
 
-  // Every call Jev made against a real website deal, split into the few it is
-  // unsure about (cards) and the confident rest (optional skim list).
-  const { unsure, sure } = useMemo(() => {
-    if (!categorized) return { unsure: [], sure: [] };
-    const calls = [...categorized.update, ...categorized.onSite, ...categorized.added]
-      .filter(r => (r.meta?.candidates?.length || r.meta?.reviewCandidates?.length) && !r.meta?.jevSkipped)
-      .sort((a, b) => (a.meta?.jevError ? -1 : a.meta?.confidence ?? 0) - (b.meta?.jevError ? -1 : b.meta?.confidence ?? 0) || a.hq.id - b.hq.id);
-    // A row the operator already decided stays where it was first sorted.
-    const isUnsure = (r) => (r.meta?.reviewed ? !!decisions[r.hq.id]?.wasUnsure : needsReview(r));
-    return { unsure: calls.filter(isUnsure), sure: calls.filter(r => !isUnsure(r)) };
-  }, [categorized, decisions]);
-  const [skimming, setSkimming] = useState(false);
-  // Freeze the order when review starts so cards don't jump as calls change.
-  const [reviewOrder, setReviewOrder] = useState([]);
-  const startReview = (rows = unsure) => {
-    const pending = rows.filter(r => !decisions[r.hq.id]);
-    setReviewOrder((pending.length ? pending : rows).map(r => r.hq.id));
-    setReviewAt(0);
+  const queue = useMemo(() => buildReviewQueue(categorized, decisions), [categorized, decisions]);
+  const filtered =(rows) => rows.filter((row) => `${row.hq.vendor} ${row.hq.text} ${row.web?.raw?.title || ''}`.toLowerCase().includes(search.toLowerCase()));
+  const decide = (id, value) => {
+    setLastDecision({ previous: { ...decisions } });
+    const next = { ...decisions };
+    if (value === undefined) delete next[id]; else next[id] = value;
+    updateSession({ decisions: next });
+  };
+  const undo = () => {
+    if (!lastDecision) return;
+    updateSession({ decisions: lastDecision.previous });
+    setLastDecision(null);
   };
 
-  const decide = useCallback((row, verdict, webIndex) => {
-    const wasUnsure = row.meta?.reviewed ? !!decisions[row.hq.id]?.wasUnsure : needsReview(row);
-    updateSession({ decisions: { ...decisions, [row.hq.id]: { verdict, web: verdict === 'new' ? null : webIndex, wasUnsure } } });
-    setReviewAt((at) => at + 1);
-  }, [decisions, updateSession]);
+  const dateWarnings = useMemo(() => hqDeals.filter((deal) => deal.dateWarning), [hqDeals]);
 
-  const loadExport = useCallback(async (file) => {
+  const handleFileLoad = useCallback(async (event) => {
+    const file = event.target.files?.[0];
     if (!file) return;
+
     try {
-      const rows = parseWebsiteRows(await file.text());
+      const text = await file.text();
+      const rows = parseWebsiteRows(text);
       const validation = await validateWebsiteExport(rows);
+
       if ('error' in validation) {
         setImportError(validation.error.message);
+        updateSession({ websiteRows: [], lastRun: null, decisions: {} });
+        showToast('Website export not recognized', 'error');
         return;
       }
+
       setImportError('');
       updateSession({ websiteRows: validation.data.rows, websiteFileName: file.name, lastRun: null, decisions: {} });
+      showToast(
+        `${validation.data.recognizedCount} website deals loaded`,
+        'success',
+      );
     } catch (error) {
-      setImportError(`That file isn't a website export (${error instanceof Error ? error.message : String(error)}).`);
+      const message = error instanceof Error ? error.message : String(error);
+      setImportError(`Could not read this JSON file: ${message}`);
+      updateSession({ websiteRows: [], lastRun: null, decisions: {} });
+      showToast('Failed to parse website JSON', 'error');
+    } finally {
+      event.target.value = '';
     }
-  }, [updateSession]);
+  }, [showToast, updateSession]);
 
-  const dropProps = {
-    onDragOver: (event) => { event.preventDefault(); setDragging(true); },
-    onDragLeave: () => setDragging(false),
-    onDrop: (event) => { event.preventDefault(); setDragging(false); loadExport(event.dataTransfer.files?.[0]); },
+  const runMatcher = useCallback(() => {
+    if (!hqDeals.length) {
+      showToast('Paste HQ text first', 'error');
+      return;
+    }
+    if (!websiteRows.length) {
+      showToast('Load website JSON first', 'error');
+      return;
+    }
+
+    updateSession({
+      lastRun: {
+        matcherVersion: MATCHER_VERSION,
+        hqText,
+        websiteRows,
+        supplierFilter,
+      },
+      decisions: {},
+      viewFilter: 'work',
+    });
+    setLastDecision(null);
+  }, [hqDeals.length, hqText, showToast, supplierFilter, updateSession, websiteRows]);
+
+
+  const handleExportWork = async () => {
+    if (!queue.work.length) return;
+    try {
+      await navigator.clipboard.writeText(exportUnmatched(queue.work.map(row => row.hq)));
+      showToast('Work list copied', 'success');
+    } catch { showToast('Clipboard unavailable. Please try again.', 'error'); }
   };
-  const fileInput = <input ref={fileRef} type="file" accept=".json" className="visually-hidden" onChange={(event) => { loadExport(event.target.files?.[0]); event.target.value = ''; }} />;
-
-  if (!hqDeals.length) {
-    return <div className="calm"><p className="calm-head">Nothing to compare yet.</p><p className="calm-sub">Tag this week's deals first.</p></div>;
-  }
-
-  if (!websiteRows.length) {
-    return <div className={`calm calm-drop ${dragging ? 'is-dragging' : ''}`} {...dropProps} onClick={() => fileRef.current?.click()} role="button" tabIndex={0}>
-      <p className="calm-head">Drop this week's website export here.</p>
-      <p className="calm-sub">{importError || 'Or click anywhere to choose it.'}</p>
-      {fileInput}
-    </div>;
-  }
-
-  if (!categorized) {
-    const pct = progress?.total ? Math.round((progress.done / progress.total) * 100) : 0;
-    return <div className="calm">
-      <p className="calm-head">Jev is comparing your deals…</p>
-      <div className="calm-bar"><span style={{ width: `${pct}%` }} /></div>
-      <p className="calm-sub">{progress ? `${progress.done} of ${progress.total}` : ''}</p>
-    </div>;
-  }
-
-  const byId = new Map<number, any>((results || []).map((r: any) => [r.hq.id, r]));
-  const reviewRow = reviewAt >= 0 && reviewAt < reviewOrder.length ? byId.get(reviewOrder[reviewAt]) : null;
-  if (reviewRow) {
-    // Re-ask Jev with the operator's doubt; the new answer replaces the old
-    // one and any decision on this deal is cleared so the card shows it.
-    const reconsider = async (row) => {
-      try {
-        const answers = await reconsiderWithJev(row.hq, frozen.web, row.web, callJev);
-        updateSession((prev) => {
-          const nextDecisions = { ...(prev.decisions || {}) };
-          delete nextDecisions[row.hq.id];
-          return { ...prev, decisions: nextDecisions, lastRun: { ...prev.lastRun, jev: { ...prev.lastRun.jev, [row.hq.id]: answers } } };
-        });
-      } catch {
-        showToast('Jev could not be reached', 'error');
-      }
-    };
-    return <ReviewCard
-      key={`${reviewRow.hq.id}-${lastRun.jev?.[reviewRow.hq.id]?.reconsidered ? 'again' : 'first'}-${reviewRow.web ? frozen.web.indexOf(reviewRow.web) : 'none'}`}
-      r={reviewRow}
-      websiteDeals={frozen.web}
-      position={reviewAt + 1}
-      total={reviewOrder.length}
-      onDecide={decide}
-      onBack={() => setReviewAt((at) => Math.max(0, at - 1))}
-      onClose={() => setReviewAt(-1)}
-      onReconsider={reconsider}
-    />;
-  }
-
-  if (skimming) {
-    return <SkimList
-      rows={sure}
-      onOpen={(row) => { setSkimming(false); startReview([row]); }}
-      onClose={() => setSkimming(false)}
-    />;
-  }
-
-  const toPublish = [...categorized.update, ...categorized.added];
-  const leftToReview = unsure.filter(r => !decisions[r.hq.id]).length;
-  const sendToPublish = () => {
-    const handoff = buildPublishHandoff(categorized);
-    if (!handoff) return;
-    onComplete(handoff.text, handoff.actions);
+  const handleSendToCopy = () => {
+    if (!queue.work.length) return;
+    // A same-kind website sibling means the operator will edit that entry
+    // rather than create a new one, so Copywriting keeps its URL.
+    onComplete(exportUnmatched(queue.work.map(row => row.hq)), queue.work.map(row => ({
+      vendor: row.hq.vendor,
+      text: row.hq.text,
+      action: row.web && ['same', 'partial'].includes(row.meta?.typeStatus) && !row.meta?.operatorRejectedMatch ? 'update' : 'new',
+      websiteTitle: row.web?.raw?.title || '',
+    })));
   };
+
+  const canCompare = hqDeals.length > 0 && websiteDeals.length > 0;
+  const sourceVendorCount = new Set(hqDeals.map((deal) => deal.vendor)).size;
 
   return (
-    <div className={`calm ${dragging ? 'is-dragging' : ''}`} {...dropProps}>
-      <p className="calm-head">{toPublish.length ? `${plural(toPublish.length, 'deal')} ready for Publish.` : 'Everything is already on the site.'}</p>
-      <div className="tally">
-        <Tally kind="update" n={categorized.update.length} label={categorized.update.length === 1 ? 'update' : 'updates'} />
-        <Tally kind="new" n={categorized.added.length} label="new" />
-        <Tally kind="live" n={categorized.onSite.length} label="already live" />
-        {!!categorized.excluded.length && <Tally kind="out" n={categorized.excluded.length} label="end today, left out" />}
-      </div>
-      {jevDown && <p className="calm-sub calm-error">Jev isn't connected, so these are the built-in rules' calls.</p>}
-      <div className="calm-actions">
-        {leftToReview > 0 && <button className="calm-go" onClick={() => startReview()}>Check {leftToReview === 1 ? 'the 1 deal' : `the ${leftToReview} deals`} Jev isn't sure about →</button>}
-        {!!toPublish.length && <button className={leftToReview > 0 ? 'calm-second' : 'calm-go'} disabled={leftToReview > 0} onClick={sendToPublish}>Continue to Publish →</button>}
-      </div>
-      <p className="calm-note">
-        {leftToReview > 0 && 'Review the uncertain calls before continuing to Publish. '}
-        {leftToReview === 0 && unsure.length > 0 ? 'Every unsure call is checked. ' : ''}
-        {sure.length > 0 && <>Jev is sure about {sure.length} more. <button onClick={() => setSkimming(true)}>skim them</button></>}
-      </p>
-      {importError && <p className="calm-sub calm-error">{importError}</p>}
-      <p className="calm-foot">{session.websiteFileName || 'Website export'} · <button onClick={() => fileRef.current?.click()}>replace</button>{fileInput}</p>
+    <div className="dedupe-step dedupe-workflow">
+      <section className="dedupe-setup">
+        <div className="dedupe-section-heading">
+          <div><span className="workspace-eyebrow">Prepare the comparison</span><h3>Find what needs your attention.</h3></div>
+          {lastRun && <span className="status-chip status-complete">Comparison ready</span>}
+        </div>
+        <div className="dedupe-setup-grid">
+          <article className={`setup-card ${hqDeals.length ? 'is-ready' : ''}`}>
+            <span className="setup-index">1</span>
+            <div className="setup-card-copy"><span className="setup-label">New deal batch</span><strong>{hqDeals.length ? `${hqDeals.length} deals from ${sourceVendorCount} suppliers` : 'No deals loaded'}</strong><span>{hqDeals.length ? 'Carried forward from Tag' : 'Complete the Tag step first'}</span></div>
+            <span className="setup-check">{hqDeals.length ? '✓' : ''}</span>
+          </article>
+          <article className={`setup-card ${websiteDeals.length ? 'is-ready' : ''}`}>
+            <span className="setup-index">2</span>
+            <div className="setup-card-copy"><span className="setup-label">Current website</span><strong>{websiteDeals.length ? `${websiteDeals.length} live deals loaded` : 'Load the website export'}</strong><button className="setup-link" onClick={() => fileRef.current?.click()}>{websiteDeals.length ? `Replace ${session.websiteFileName || 'JSON export'}` : 'Choose true_entries.json'}</button></div>
+            <span className="setup-check">{websiteDeals.length ? '✓' : ''}</span>
+            <input ref={fileRef} type="file" accept=".json" className="visually-hidden" onChange={handleFileLoad} />
+          </article>
+          <article className={`setup-card setup-action ${canCompare ? 'is-ready' : ''}`}>
+            <span className="setup-index">3</span>
+            <div className="setup-card-copy"><span className="setup-label">Compare</span><strong>{canCompare ? 'Find what is already live' : 'Waiting for both inputs'}</strong><span>Review matches, keep new and changed deals.</span></div>
+            <button className="btn btn-accent compare-button" onClick={runMatcher} disabled={!canCompare}>{lastRun ? 'Compare again' : 'Compare deals'}</button>
+          </article>
+        </div>
+        {importError && <div className="gate-warning gate-warning-error import-blocker" role="alert"><strong>That website export could not be used.</strong><div>{importError}</div></div>}
+        <details className="dedupe-disclosure">
+          <div className="advanced-grid">
+            <label className="advanced-source"><span>Tagged source</span><textarea value={hqText} onChange={(event) => updateSession({ hqText: event.target.value, lastRun: null, decisions: {} })} spellCheck={false} /></label>
+            <div className="advanced-controls">
+              <label className="mini-label">Supplier <select value={supplierFilter} onChange={(event) => updateSession({ supplierFilter: event.target.value, lastRun: null, decisions: {} })}><option value="">All suppliers</option>{webSuppliers.map((supplier) => <option key={String(supplier)}>{String(supplier)}</option>)}</select></label>
+              <button className={`btn ${restrictToday ? 'btn-danger' : ''}`} onClick={() => updateSession({ restrictToday: !restrictToday })}>Exclude ending today: {restrictToday ? 'On' : 'Off'}</button>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      {dateWarnings.length > 0 && (
+        <details className="dedupe-disclosure warning-disclosure">
+          <summary>{dateWarnings.length} date {dateWarnings.length === 1 ? 'warning' : 'warnings'} need review</summary>
+          {dateWarnings.map((deal, index) => <div key={index} className="date-warning"><strong>{deal.vendor}:</strong> {deal.dateWarning}<div className="mini">{deal.text}</div></div>)}
+        </details>
+      )}
+
+      {categorized ? (
+        <section className="dedupe-results">
+          <div className="results-hero">
+            <div><span className="workspace-eyebrow">Your work list</span><h3>{queue.work.length} to work on · {queue.skipped.length} already on the site</h3><p>{queue.pending.length ? `${queue.pending.length} look identical to the website. Confirm them to set them aside.` : 'Everything identical has been set aside.'}</p></div>
+            <div className="results-actions">
+              <button className="btn" disabled={!queue.work.length || !!queue.pending.length} onClick={handleExportWork}>Copy work list</button>
+              <button className="btn btn-forward" disabled={!queue.work.length || !!queue.pending.length} onClick={handleSendToCopy}>{queue.pending.length ? `Confirm ${queue.pending.length} identical first` : `Send ${queue.work.length} to Publish →`}</button>
+            </div>
+          </div>
+          <div className="review-toolbar">
+            <div className="review-tabs" aria-label="Comparison views">
+              <button className={`btn ${activeView === 'work' ? 'btn-accent' : ''}`} onClick={() => updateSession({ viewFilter: 'work' })}>Work list · {queue.work.length}</button>
+              <button className={`btn ${activeView === 'identical' ? 'btn-accent' : ''}`} onClick={() => updateSession({ viewFilter: 'identical' })}>Already on site · {queue.pending.length + queue.skipped.length}{queue.pending.length ? ` (${queue.pending.length} to confirm)` : ''}</button>
+            </div>
+            <label className="review-search">Find a deal<input value={search} onChange={e => setSearch(e.target.value)} placeholder="Supplier or offer…" /></label>
+            <button className="btn" disabled={!lastDecision} onClick={undo}>Undo last decision</button>
+          </div>
+          {activeView === 'identical' && queue.pending.length > 0 && <div className="review-finish"><span>{queue.pending.length} pre-checked as identical: same type, exclusivity, amounts, and expiry. Glance through, pull any into the work list, then confirm the rest.</span><button className="btn btn-success" onClick={() => {
+            setLastDecision({ previous: { ...decisions } });
+            updateSession({ decisions: { ...decisions, ...Object.fromEntries(queue.pending.map(row => [row.hq.id, 'skip'])) } });
+          }}>Confirm all {queue.pending.length} as already on site</button></div>}
+          <div className="compact-card-list">
+            {activeView === 'work' && filtered(queue.work).map(row => <MatchCard key={row.hq.id} r={row} today={categorized.today} onDecision={decide} state="work" />)}
+            {activeView === 'identical' && filtered(queue.pending).map(row => <MatchCard key={row.hq.id} r={row} today={categorized.today} onDecision={decide} state="pending" />)}
+            {activeView === 'identical' && filtered(queue.skipped).map(row => <MatchCard key={row.hq.id} r={row} today={categorized.today} onDecision={decide} state="skipped" />)}
+          </div>
+          {!filtered(activeView === 'work' ? queue.work : [...queue.pending, ...queue.skipped]).length && <div className="dedupe-empty"><h3>{search ? 'No deals match your search' : activeView === 'work' ? 'Nothing to work on' : 'Nothing identical to the website'}</h3><p>{activeView === 'work' && !search ? 'Every incoming deal is already on the site.' : 'Your other list is available above.'}</p></div>}
+          {!!queue.excluded.length && <details className="dedupe-disclosure"><summary>Excluded by ending-today policy · {queue.excluded.length}</summary>{queue.excluded.map(row => <p key={row.hq.id} className="review-hint">{row.hq.vendor} · {row.hq.text}</p>)}</details>}
+        </section>
+      ) : <div className="dedupe-empty"><h3>{lastRun && lastRun.matcherVersion !== MATCHER_VERSION ? 'Matching has improved — compare again' : 'Load your website export, then compare'}</h3><p>{lastRun && lastRun.matcherVersion !== MATCHER_VERSION ? 'Your inputs are saved. Run a fresh comparison before reviewing the updated candidates.' : 'Your saved source and website file stay here while you move between steps.'}</p></div>}
     </div>
   );
 }
 
-const GLYPH = { same: '✓', different: '✗', partial: '~', unknown: '?', 'n/a': '–', open: '–' };
+const STATUS_GLYPH = { same: '✓', different: '✗', partial: '~', unknown: '?', 'n/a': '–' };
 
-// The typed facts side by side. A website deal with no end date is neutral:
-// it says nothing about expiry.
-function FactsTable({ hq, web }) {
-  const checks = web ? compareMarkers(hq, web).checks : null;
-  if (!checks) return null;
-  return <table className="facts">
+function MarkerChecklist({ checks }) {
+  if (!checks?.length) return null;
+  return <table className="marker-checklist">
+    <thead><tr><th>Marker</th><th>Incoming</th><th>Website</th></tr></thead>
     <tbody>
-      {checks.map((c) => {
-        // Ongoing and no end date are the same thing; a dated deal vs no end date is neutral.
-        const status = c.key === 'expiry' && !web.expiryDate ? (hq.ongoing || !hq.end ? 'same' : 'open') : c.status;
-        return <tr key={c.key} className={`fact-${status === 'n/a' ? 'na' : status}`}>
-          <th><span className="fact-glyph">{GLYPH[status] || '?'}</span>{c.label}</th>
-          <td>{c.hq}</td>
-          <td>{c.key === 'expiry' && !web.expiryDate ? 'No end date' : c.web}</td>
-        </tr>;
-      })}
+      {checks.map(check => <tr key={check.key} className={`marker-${check.status}`}>
+        <th scope="row"><span className="marker-glyph" aria-hidden="true">{STATUS_GLYPH[check.status] || '?'}</span>{check.label}</th>
+        <td>{check.hq}</td>
+        <td>{check.web}</td>
+      </tr>)}
     </tbody>
   </table>;
 }
 
-/**
- * One of Jev's calls: this week's deal beside the website deal Jev picked,
- * the typed facts compared, and Jev's verdict. → keeps Jev's call; U / L set
- * update or live against the shown deal; N means "not this one" and steps to
- * Jev's next most likely website deal, landing on new when none are left;
- * R asks Jev to reconsider.
- */
-function ReviewCard({ r, websiteDeals, position, total, onDecide, onBack, onClose, onReconsider }) {
-  const ranked = r.meta?.ranked?.length ? r.meta.ranked : (r.meta?.candidates || []).map(web => ({ web, p: null }));
-  const jevVerdict = r.web ? r.meta?.verdict : 'new';
-  // Even when Jev says new, start on its closest website deal so it can be compared.
-  const start = r.web ? Math.max(0, ranked.findIndex(x => x.web === r.web)) : 0;
-  const [at, setAt] = useState(start);
-  const [asking, setAsking] = useState(false);
-  const shown = at < ranked.length ? ranked[at] : null;
-  const web = shown?.web || null;
-  const index = web ? websiteDeals.indexOf(web) : null;
-  const sure = r.meta?.jevError ? null : Math.round((r.meta?.confidence ?? 0) * 100);
-  const isJevPick = !!web && web === r.web;
-
-  // Looking at a different website deal than the one Jev picked.
-  const onAlt = !!r.web && at !== start;
-  const jevIndex = r.web ? websiteDeals.indexOf(r.web) : null;
-  // "It is this deal": live when every stated term agrees, otherwise update.
-  const sameAs = useCallback((w, i) => onDecide(r, compareMarkers(r.hq, w).differences.some(k => ['dollars', 'percents', 'nights', 'expiry'].includes(k)) ? 'update' : 'on-site', i), [onDecide, r]);
-  const correct = useCallback(() => {
-    if (onAlt && web) sameAs(web, index);
-    else onDecide(r, jevVerdict, jevIndex);
-  }, [onAlt, web, index, sameAs, onDecide, r, jevVerdict, jevIndex]);
-  // Wrong on a match: try Jev's next plausible website deal, else it is new.
-  // Wrong on "new": it is the closest website deal shown.
-  const wrong = useCallback(() => {
-    if (!r.web) {
-      if (web) sameAs(web, index); else onDecide(r, 'new', null);
-      return;
-    }
-    const next = ranked.findIndex((x, i) => i > at && i !== start && (x.p == null || x.p >= 0.1));
-    if (next >= 0) setAt(next); else onDecide(r, 'new', null);
-  }, [r, web, index, sameAs, onDecide, ranked, at, start]);
-  const reconsider = useCallback(async () => {
-    if (asking || r.meta?.reviewReason === 'exclusivity-mismatch') return;
-    setAsking(true);
-    try { await onReconsider(r); } finally { setAsking(false); }
-  }, [asking, onReconsider, r]);
-
-  useEffect(() => {
-    const onKey = (event) => {
-      if (event.target instanceof HTMLElement && ['INPUT', 'TEXTAREA'].includes(event.target.tagName)) return;
-      const key = event.key.toLowerCase();
-      if (key === 'arrowright' || key === 'enter' || key === 'c') correct();
-      else if (key === 'arrowleft') onBack();
-      else if (key === 'escape') onClose();
-      else if (key === 'u' && web) onDecide(r, 'update', index);
-      else if (key === 'w' || key === 'n') wrong();
-      else if (key === 'r') reconsider();
-      else return;
-      event.preventDefault();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [web, index, onDecide, r, onBack, onClose, correct, wrong, reconsider]);
-
-  const others = ranked.length - 1;
-  return <div className="review">
-    <div className="review-top">
-      <span>{position} of {total}</span>
-      <span className="review-progress" aria-hidden="true"><span style={{ width: `${Math.round(((position - 1) / Math.max(1, total)) * 100)}%` }} /></span>
-      <button onClick={onClose}>done for now</button>
-    </div>
-    <p className="review-supplier">{r.hq.vendor}</p>
-    <div className="review-pair">
-      <div className="review-side">
-        <span className="review-label">This week</span>
-        <p className="review-text">{r.hq.text}</p>
-      </div>
-      <div className="review-side is-site">
-        <span className="review-label">
-          {web ? `${r.meta?.reviewReason && !r.web ? 'Possible existing website deal' : isJevPick ? 'On the website — Jev\'s pick' : jevVerdict === 'new' && at === 0 ? 'Closest on the website' : 'On the website'}${shown.p != null ? ` · Jev ${Math.round(shown.p * 100)}% match` : ''}` : 'On the website'}
-        </span>
-        {web ? <>
-          <p className="review-text">{web.raw?.title}</p>
-          {web.raw?.shopListing && <p className="review-desc">{web.raw.shopListing}</p>}
-        </> : <p className="review-text review-none">{ranked.length ? `None of ${r.hq.vendor}'s ${ranked.length} website ${ranked.length === 1 ? 'deal matches' : 'deals match'}.` : `${r.hq.vendor} has nothing comparable on the site.`}</p>}
-      </div>
-    </div>
-    <FactsTable hq={r.hq} web={web} />
-    <p className="review-call">
-      {r.meta?.reviewReason === 'exclusivity-mismatch'
-        ? <>Possible existing deal: the terms match, but one version is marked exclusive. Confirm whether they are the same offer.</>
-        : r.meta?.reviewReason === 'matching-terms'
-        ? <>Possible existing deal: the parsed terms match an offer already on the website. Confirm whether any work is needed.</>
-        : onAlt
-        ? <>Is it this one instead?</>
-        : <>Jev: <strong>{CALL[jevVerdict]}</strong>{sure !== null ? ` · ${sure}% sure` : ' · Jev unavailable, built-in rules'}{r.meta?.reconsidered ? ' · reconsidered' : ''}</>}
-    </p>
-    <div className="review-buttons">
-      <button className="is-main" onClick={correct}>{r.meta?.reviewReason && !r.web ? 'Keep as separate deal' : onAlt ? 'Yes, this one' : 'Correct'} <kbd>→</kbd></button>
-      <button className="is-update" disabled={!web} onClick={() => onDecide(r, 'update', index)}>Same deal, update <kbd>U</kbd></button>
-      <button className="is-wrong" onClick={r.meta?.reviewReason && !r.web && web ? () => onDecide(r, 'on-site', index) : wrong}>{r.meta?.reviewReason && !r.web && web ? 'Already current' : onAlt ? 'No' : 'Wrong'} <kbd>W</kbd></button>
-    </div>
-    <p className="review-others">
-      {r.meta?.reviewReason !== 'exclusivity-mismatch' && <button onClick={reconsider} disabled={asking}>{asking ? 'asking Jev…' : 'ask Jev again'}</button>}
-      {others > 0 && <> · other {r.hq.vendor} deals: {ranked.map((x, i) => i === at ? null : <button key={i} onClick={() => setAt(i)}>{x.web.raw?.title}{x.p != null ? ` (${Math.round(x.p * 100)}%)` : ''}</button>)}</>}
-      {others === 0 && web && <> · no other {r.hq.vendor} deals on the site</>}
-    </p>
-  </div>;
+function differenceSummary(r) {
+  if (!r.web) return r.meta?.noWebDeals ? 'This supplier has no deals on the website yet.' : 'No similar deal on the website for this supplier.';
+  if (r.meta?.operatorRejectedMatch) return 'You pulled this into the work list.';
+  const labels = { type: 'type of offer', exclusive: 'exclusivity', expiry: 'expiry date', dollars: 'amounts', percents: 'percentages', nights: 'nights' };
+  const diffs = (r.meta?.differences || []).map(key => labels[key] || key);
+  if (r.meta?.typeStatus === 'partial') diffs.unshift('type only partly overlaps');
+  if (!diffs.length) return '';
+  return `Differs on ${diffs.join(', ')}.`;
 }
 
-const SKIM_CALL = { update: 'update', 'on-site': 'already live', new: 'new' };
-
-/**
- * Optional: Jev's confident calls as one skimmable list, this week's deal
- * beside the website deal it matched. Clicking a row opens it as a card.
- */
-function SkimList({ rows, onOpen, onClose }) {
-  useEffect(() => {
-    const onKey = (event) => { if (event.key === 'Escape') onClose(); };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-  return <div className="skim">
-    <div className="review-top">
-      <span>Jev is sure about these {rows.length}. Click any that look wrong.</span>
-      <button onClick={onClose}>back</button>
+function MatchCard({ r, today, onDecision, state }) {
+  const summary = differenceSummary(r);
+  const isIdentical = state !== 'work';
+  return <article className={`match-card review-card card-${state}`}>
+    <div className="match-header">
+      <span className="supplier-name">{r.hq.vendor}</span>
+      {r.hq.type === 'exclusive' && <span className="pill pill-purple">Exclusive</span>}
+      {state === 'pending' && <span className="pill pill-ok">Looks identical</span>}
+      {state === 'skipped' && <span className="pill">Already on site</span>}
+      {state === 'work' && !r.web && <span className="pill pill-accent">New</span>}
+      {state === 'work' && r.web && <span className="pill pill-warn">Changed</span>}
+      {sameDay(r.hq.end, today) && <span className="pill pill-warn">Ends today</span>}
     </div>
-    <div className="skim-list">
-      {rows.map(r => <button key={r.hq.id} className="skim-row" onClick={() => onOpen(r)}>
-        <span className="skim-who">{r.hq.vendor}</span>
-        <span className="skim-in">{r.hq.text}</span>
-        <span className="skim-arrow">→</span>
-        <span className={`skim-site ${r.web ? '' : 'is-none'}`}>{r.web ? r.web.raw?.title : 'not on the site'}</span>
-        <span className={`skim-call is-${r.web ? r.meta?.verdict : 'new'}`}>{SKIM_CALL[r.web ? r.meta?.verdict : 'new']}</span>
-      </button>)}
+    {summary && <div className={`comparison-summary ${isIdentical ? 'is-quiet' : ''}`}>{summary}</div>}
+    <div className="match-grid">
+      <div className="match-side match-side-incoming"><h4>Incoming</h4><p className="match-text">{r.hq.text}</p><div className="match-meta">{r.hq.ongoing ? 'Ongoing' : r.hq.end ? `Ends ${dateFmt.format(r.hq.end)}` : 'No end date in source'}</div></div>
+      <div className="match-side match-side-website"><h4>{r.web ? 'On the website' : 'Website'}</h4>{r.web ? <><p className="match-text">{r.web.raw?.title || r.web.text}</p><p className="website-description">{r.web.raw?.shopListing || ''}</p><div className="match-meta">{r.web.expiryDate ? `Ends ${dateFmt.format(r.web.expiryDate)}` : 'No website expiry'}</div></> : <p className="match-text match-text-empty">Nothing similar</p>}</div>
     </div>
-  </div>;
-}
-
-// Counts up from zero when the summary appears.
-function useCountUp(target, ms = 700) {
-  const [value, setValue] = useState(0);
-  useEffect(() => {
-    let frame = 0;
-    const start = performance.now();
-    const tick = (now) => {
-      const t = Math.min(1, (now - start) / ms);
-      setValue(Math.round(target * (1 - (1 - t) ** 3)));
-      if (t < 1) frame = requestAnimationFrame(tick);
-    };
-    frame = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(frame);
-  }, [target, ms]);
-  return value;
-}
-
-function Tally({ kind, n, label }) {
-  const shown = useCountUp(n);
-  return <div className={`tally-item tally-${kind}`}>
-    <span className="tally-num" aria-hidden="true">{shown}</span>
-    <span className="tally-label"><span className="visually-hidden">{n} </span>{label}</span>
-  </div>;
+    {r.web && <MarkerChecklist checks={r.meta?.checks} />}
+    <div className="card-actions">
+      {state === 'work' && <button className="btn btn-success" onClick={() => onDecision(r.hq.id, 'skip')}>Already on site</button>}
+      {state === 'pending' && <><button className="btn btn-success" onClick={() => onDecision(r.hq.id, 'skip')}>Confirm · already on site</button><button className="btn btn-reject" onClick={() => onDecision(r.hq.id, 'work')}>Move to work list</button></>}
+      {state === 'skipped' && <button className="btn" onClick={() => onDecision(r.hq.id, 'work')}>Move to work list</button>}
+      {state === 'work' && r.meta?.operatorRejectedMatch === undefined && r.meta?.identical && <button className="btn" onClick={() => onDecision(r.hq.id, undefined)}>Undo</button>}
+      {r.web && <a className="btn" href={`https://travelperks.com/admin/entries/deals?search=${encodeURIComponent(r.web.raw?.title || r.hq.vendor)}`} target="travelperks-admin" rel="noreferrer">Find on website ↗</a>}
+    </div>
+    {r.meta?.candidateRankings?.length > 1 && <details className="match-evidence"><summary>Other website deals for {r.hq.vendor}</summary>
+      {r.meta.candidateRankings.map((candidate, index) => <p className="match-meta" key={index}><strong>{candidate.title}</strong> · {candidate.types}</p>)}</details>}
+  </article>;
 }

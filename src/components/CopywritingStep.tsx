@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   parseRawToGroups,
   generatePrompt,
@@ -10,133 +10,146 @@ import {
   createDealSlug,
 } from "../logic/copywriting.js";
 
+let confettiLoaded = false;
 let confettiFn = null;
+
 function loadConfetti() {
-  if (confettiFn) return;
-  import("canvas-confetti").then((mod) => { confettiFn = mod.default; }).catch(() => {});
-}
-const CONFETTI_COLORS = ["#7fe3bd", "#0b6150", "#f6b866", "#9db8ff", "#c7b4f7"];
-
-// A small burst from the deal's check button when it is published.
-function burstFrom(key) {
-  if (!confettiFn) return;
-  const el = document.querySelector(`[data-deal-key="${key}"] .deal-check`);
-  const r = el?.getBoundingClientRect();
-  const origin = r ? { x: (r.left + r.width / 2) / window.innerWidth, y: (r.top + r.height / 2) / window.innerHeight } : { x: 0.5, y: 0.5 };
-  confettiFn({ particleCount: 36, spread: 60, startVelocity: 26, scalar: 0.8, ticks: 120, origin, colors: CONFETTI_COLORS, zIndex: 2000 });
+  if (confettiLoaded) return Promise.resolve(confettiFn);
+  return import("canvas-confetti")
+    .then((mod) => {
+      confettiFn = mod.default;
+      confettiLoaded = true;
+      return confettiFn;
+    })
+    .catch(() => null);
 }
 
-// Fireworks when the whole queue is published.
-function fireworks() {
-  if (!confettiFn) return;
-  const end = Date.now() + 2200;
-  (function frame() {
-    confettiFn({ particleCount: 6, angle: 60, spread: 70, origin: { x: 0, y: 0.7 }, colors: CONFETTI_COLORS, zIndex: 2000 });
-    confettiFn({ particleCount: 6, angle: 120, spread: 70, origin: { x: 1, y: 0.7 }, colors: CONFETTI_COLORS, zIndex: 2000 });
-    if (Date.now() < end) requestAnimationFrame(frame);
-  })();
-  setTimeout(() => confettiFn({ particleCount: 160, spread: 100, startVelocity: 45, origin: { y: 0.45 }, colors: CONFETTI_COLORS, zIndex: 2000 }), 300);
+function fireConfetti() {
+  if (confettiFn) {
+    confettiFn({
+      particleCount: 100,
+      spread: 70,
+      origin: { y: 0.6 },
+      colors: ["#3b82f6", "#10b981", "#8b5cf6", "#f97316"],
+      zIndex: 2000,
+      disableForReducedMotion: true,
+    });
+  }
 }
-
-const FIELD_LABEL = { h: "headline", d: "description", sd: "start date", ed: "end date", slug: "URL slug" };
-
-// The copy order the operator works in: headline, description, dates, slug.
-function fieldsFor(deal, showSlug) {
-  const fields = ["h", "d"];
-  if (deal.startDate) fields.push("sd");
-  if (deal.endDate) fields.push("ed");
-  if (showSlug && deal.urlSlug) fields.push("slug");
-  return fields;
-}
-function valueOf(deal, field) {
-  return { h: deal.headline, d: deal.description, sd: deal.startDate, ed: deal.endDate, slug: deal.urlSlug }[field];
-}
-
-const blankDeal = (d) => ({
-  dealId: d.dealId,
-  dealIndex: d.dealIndex,
-  urlSlug: createDealSlug(d.originalText),
-  headline: "MISSING HEADLINE",
-  description: "Needs copy. Call to speak with an agent!",
-  startDate: null,
-  endDate: null,
-  dateNote: null,
-  originalText: d.originalText,
-  isExclusive: d.isExclusive,
-  warnings: [{ severity: "warn", msg: "New deal added. Generate or paste copy for it." }],
-  checked: false,
-});
 
 /**
- * Manages the AI-copy workflow: copy the batch prompt, paste the reply (it is
- * checked as soon as it is pasted), then move each field to the website. In
- * the queue, C copies the current deal's next field; once every field is
- * copied the deal is marked published and the next one is selected.
+ * Manages the manual AI-copy workflow from prompt generation through lint
+ * review, targeted repair, completion tracking, and field-by-field clipboard
+ * handoff. Generated copy remains session data until the operator explicitly
+ * accepts warnings and checks each deal complete.
  */
 export default function CopywritingStep({ session, onSessionChange, showToast }) {
   const { view, rawInput, jsonInput, finalGroups, houseStyle, dealNotes } = session;
   const [workFilter, setWorkFilter] = useState("pending");
   const [workSearch, setWorkSearch] = useState("");
-  const [flash, setFlash] = useState(null);
-  const [copied, setCopied] = useState({});
-  const [cursor, setCursor] = useState(null);
-  const [justDone, setJustDone] = useState(null);
-  const [checkResult, setCheckResult] = useState(null);
-  const [dialog, setDialog] = useState(null);
+  const [copySuccess, setCopySuccess] = useState({});
+  const [validationError, setValidationError] = useState(null);
+  const [validationWarnings, setValidationWarnings] = useState(null);
+  const [pendingData, setPendingData] = useState(null);
+  const [showReset, setShowReset] = useState(false);
+  const [showStyleEditor, setShowStyleEditor] = useState(false);
+  const [expandedNotes, setExpandedNotes] = useState({});
+  const [patchModal, setPatchModal] = useState(null);
   const [patchInput, setPatchInput] = useState("");
-  const [quickAdd, setQuickAdd] = useState({ vendor: "", text: "", exclusive: false });
+  const [showQuickAdd, setShowQuickAdd] = useState(false);
+  const [quickAddVendor, setQuickAddVendor] = useState("");
+  const [quickAddDealText, setQuickAddDealText] = useState("");
+  const [quickAddExclusive, setQuickAddExclusive] = useState(false);
 
-  useEffect(() => { loadConfetti(); }, []);
-
-  const updateSession = useCallback((patch) => {
-    onSessionChange((prev) => (typeof patch === "function" ? patch(prev) : { ...prev, ...patch }));
-  }, [onSessionChange]);
-
-  // Older sessions may lack slugs; fill them in once in the queue.
   useEffect(() => {
-    if (view !== "work" || !finalGroups.some((g) => g.deals.some((d) => !d.urlSlug))) return;
+    loadConfetti();
+  }, []);
+
+  const updateSession = useCallback(
+    (patch) => {
+      onSessionChange((prev) => (
+        typeof patch === "function" ? patch(prev) : { ...prev, ...patch }
+      ));
+    },
+    [onSessionChange],
+  );
+
+  useEffect(() => {
+    if (
+      view !== "work" ||
+      !finalGroups.some((group) => group.deals.some((deal) => !deal.urlSlug))
+    ) return;
+
     updateSession((prev) => ({
       ...prev,
-      finalGroups: prev.finalGroups.map((g) => ({ ...g, deals: g.deals.map((d) => ({ ...d, urlSlug: d.urlSlug || createDealSlug(d.headline || d.originalText) })) })),
+      finalGroups: prev.finalGroups.map((group) => ({
+        ...group,
+        deals: group.deals.map((deal) => ({
+          ...deal,
+          urlSlug: deal.urlSlug || createDealSlug(deal.headline || deal.originalText),
+        })),
+      })),
     }));
   }, [view, finalGroups, updateSession]);
 
-  const rawGroups = useMemo(() => parseRawToGroups(rawInput), [rawInput]);
-  const rawDealCount = rawGroups.reduce((n, g) => n + g.deals.length, 0);
-
   const handleGeneratePrompt = useCallback(() => {
-    if (!rawGroups.length) {
-      showToast("No suppliers found. Use 'v Name' lines.", "error");
+    const groups = parseRawToGroups(rawInput);
+    if (groups.length === 0) {
+      showToast("No vendors found. Use 'v Name' format.", "error");
       return;
     }
-    navigator.clipboard.writeText(generatePrompt(rawGroups, houseStyle))
-      .then(() => showToast(`Prompt for ${rawGroups.length} suppliers copied`, "success"))
-      .catch(() => showToast("Could not copy. Please try again.", "error"));
-  }, [rawGroups, houseStyle, showToast]);
+    const prompt = generatePrompt(groups, houseStyle);
+    navigator.clipboard.writeText(prompt).then(() => {
+      showToast(`Prompt for ${groups.length} vendors copied`, "success");
+    });
+  }, [rawInput, houseStyle, showToast]);
 
-  const openQueue = useCallback((data) => {
-    updateSession({ finalGroups: data, view: "work" });
-    setCheckResult(null);
-    window.scrollTo(0, 0);
-  }, [updateSession]);
+  const handleValidate = useCallback(() => {
+    try {
+      const rawGroups = parseRawToGroups(rawInput);
+      const result = validateAndMerge(rawGroups, jsonInput);
 
-  // Check the AI reply as soon as it is pasted. Only on the input view, so a
-  // queue in progress is never rebuilt.
-  useEffect(() => {
-    if (view !== "input") return;
-    if (!jsonInput.trim()) { setCheckResult(null); return; }
-    const timer = setTimeout(() => {
-      try {
-        const result = validateAndMerge(parseRawToGroups(rawInput), jsonInput);
-        if (result.error) setCheckResult({ error: result.error });
-        else if (result.warnings?.length) setCheckResult({ warnings: result.warnings, data: result.data });
-        else openQueue(result.data);
-      } catch (e) {
-        setCheckResult({ error: { title: "That reply isn't complete JSON yet", msg: e.message } });
+      if (result.error) {
+        setValidationError(result.error);
+        return;
       }
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [view, jsonInput, rawInput, openQueue]);
+
+      if (result.warnings && result.warnings.length > 0) {
+        setValidationWarnings(result.warnings);
+        setPendingData(result.data);
+        return;
+      }
+
+      updateSession({
+        finalGroups: result.data,
+        view: "work",
+      });
+      window.scrollTo(0, 0);
+    } catch (e) {
+      showToast("JSON Syntax Error: " + e.message, "error");
+    }
+  }, [jsonInput, rawInput, showToast, updateSession]);
+
+  const handleProceedPastGate = useCallback(() => {
+    if (pendingData) {
+      updateSession({
+        finalGroups: pendingData,
+        view: "work",
+      });
+      setValidationWarnings(null);
+      setPendingData(null);
+      window.scrollTo(0, 0);
+    }
+  }, [pendingData, updateSession]);
+
+  const handleCancelGate = useCallback(() => {
+    setValidationWarnings(null);
+    setPendingData(null);
+  }, []);
+
+  // Tracks which copyable fields have been clicked per deal, so page 3 can
+  // auto-mark a deal published once every field has been copied.
+  const copiedFieldsRef = useRef({});
 
   const toggleCheck = useCallback((vIdx, dIdx, forceState = null) => {
     updateSession((prev) => ({
@@ -144,323 +157,795 @@ export default function CopywritingStep({ session, onSessionChange, showToast })
       finalGroups: prev.finalGroups.map((g, gi) => ({
         ...g,
         deals: g.deals.map((d, di) => {
-          if (gi !== vIdx || di !== dIdx) return d;
-          const next = forceState !== null ? forceState : !d.checked;
-          if (next && !d.checked) {
-            setTimeout(() => setJustDone(`${vIdx}-${dIdx}`), 0);
-            const allDone = prev.finalGroups.every((group, x) => group.deals.every((deal, y) => (x === vIdx && y === dIdx) || deal.checked));
-            setTimeout(() => (allDone ? fireworks() : burstFrom(`${vIdx}-${dIdx}`)), 0);
+          if (gi === vIdx && di === dIdx) {
+            const next = forceState !== null ? forceState : !d.checked;
+            // Reopening clears the copy tracker so the next full pass re-arms auto-mark.
+            if (!next) delete copiedFieldsRef.current[`${vIdx}-${dIdx}`];
+            if (next && prev.finalGroups.every((group, groupIndex) => group.deals.every((deal, dealIndex) => (groupIndex === vIdx && dealIndex === dIdx) || deal.checked))) fireConfetti();
+            return { ...d, checked: next };
           }
-          return { ...d, checked: next };
+          return d;
         }),
       })),
     }));
-    if (forceState === false || forceState === null) setCopied((prev) => { const n = { ...prev }; delete n[`${vIdx}-${dIdx}`]; return n; });
   }, [updateSession]);
 
-  // Copy one field; once every field of a deal is copied it is published.
-  const copyField = useCallback((vIdx, dIdx, deal, field, showSlug) => {
-    const key = `${vIdx}-${dIdx}`;
-    navigator.clipboard.writeText(valueOf(deal, field) || "").then(() => {
-      setFlash(`${key}-${field}`);
-      setTimeout(() => setFlash((f) => (f === `${key}-${field}` ? null : f)), 1200);
-      setCursor(key);
-      setCopied((prev) => {
-        const mine = { ...(prev[key] || {}), [field]: true };
-        if (!deal.checked && fieldsFor(deal, showSlug).every((f) => mine[f])) toggleCheck(vIdx, dIdx, true);
-        return { ...prev, [key]: mine };
-      });
+  // autoMark: { field, vIdx, dIdx, deal, showSlug } — once every copyable field
+  // on that deal has been clicked, mark it published automatically.
+  const handleCopy = useCallback((text, key, autoMark = null) => {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopySuccess((prev) => ({ ...prev, [key]: true }));
+      if (autoMark) {
+        const { field, vIdx, dIdx, deal, showSlug } = autoMark;
+        const dealKey = `${vIdx}-${dIdx}`;
+        const copied = { ...(copiedFieldsRef.current[dealKey] || {}), [field]: true };
+        copiedFieldsRef.current[dealKey] = copied;
+        const required = ["h", "d"];
+        if (deal.startDate) required.push("sd");
+        if (deal.endDate) required.push("ed");
+        if (showSlug && deal.urlSlug) required.push("slug");
+        if (required.every((f) => copied[f])) toggleCheck(vIdx, dIdx, true);
+      }
+      setTimeout(() => {
+        setCopySuccess((prev) => {
+          const n = { ...prev };
+          delete n[key];
+          return n;
+        });
+      }, 1500);
     }).catch(() => showToast("Could not copy. Please try again.", "error"));
   }, [toggleCheck, showToast]);
 
   const reset = useCallback(() => {
-    updateSession({ view: "input", rawInput: "", jsonInput: "", finalGroups: [], dealNotes: {} });
-    setDialog(null);
-    setCheckResult(null);
-    setCopied({});
+    updateSession({
+      view: "input",
+      rawInput: "",
+      jsonInput: "",
+      finalGroups: [],
+      dealNotes: {},
+    });
+    setShowReset(false);
+    setValidationWarnings(null);
+    setPendingData(null);
+    setPatchModal(null);
+    setPatchInput("");
+    setExpandedNotes({});
   }, [updateSession]);
 
-  const copyFixPrompt = useCallback((group, deal, note = "") => {
-    const prompt = generateSingleDealPrompt({ vendorName: group.name, deal, note, currentHeadline: deal.headline, currentDescription: deal.description, houseStyle });
-    navigator.clipboard.writeText(prompt).then(() => showToast("Fix prompt copied", "success"));
-  }, [houseStyle, showToast]);
+  const handleSingleDealPrompt = useCallback(
+    (group, deal, note = "") => {
+      const prompt = generateSingleDealPrompt({
+        vendorName: group.name,
+        deal,
+        note,
+        currentHeadline: deal.headline,
+        currentDescription: deal.description,
+        houseStyle,
+      });
+      navigator.clipboard.writeText(prompt).then(() => {
+        showToast(`Prompt copied for ${deal.dealId}`, "success");
+      });
+    },
+    [houseStyle, showToast],
+  );
 
-  const applyPatch = useCallback(() => {
-    if (dialog?.type !== "patch") return;
+  const handlePatchApply = useCallback(() => {
+    if (!patchModal) return;
     try {
-      const nextGroups = applyDealPatch(finalGroups, cleanAndParsePatchJSON(patchInput), {
-        dealId: dialog.deal.dealId,
-        vendorIndex: dialog.group.vendorIndex,
-        dealIndex: dialog.deal.dealIndex,
+      const parsed = cleanAndParsePatchJSON(patchInput);
+      const nextGroups = applyDealPatch(finalGroups, parsed, {
+        dealId: patchModal.deal.dealId,
+        vendorIndex: patchModal.group.vendorIndex,
+        dealIndex: patchModal.deal.dealIndex,
       });
       updateSession({ finalGroups: nextGroups });
-      setDialog(null);
+      setPatchModal(null);
       setPatchInput("");
       showToast("Deal updated", "success");
     } catch (e) {
       showToast(e.message, "error");
     }
-  }, [dialog, finalGroups, patchInput, showToast, updateSession]);
+  }, [finalGroups, patchInput, patchModal, showToast, updateSession]);
 
-  const addDeal = useCallback(() => {
+  const handleQuickAdd = useCallback(() => {
     try {
-      const nextRaw = appendDealToRawInput(rawInput, { vendorName: quickAdd.vendor, dealText: quickAdd.text, isExclusive: quickAdd.exclusive });
-      const patch: { rawInput: string; finalGroups?: any } = { rawInput: nextRaw };
+      const nextRaw = appendDealToRawInput(rawInput, {
+        vendorName: quickAddVendor,
+        dealText: quickAddDealText,
+        isExclusive: quickAddExclusive,
+      });
+      const nextSessionPatch: { rawInput: string; finalGroups?: any } = { rawInput: nextRaw };
+
       if (view === "work") {
-        patch.finalGroups = parseRawToGroups(nextRaw).map((rawGroup) => {
-          const existing = finalGroups.find((g) => g.name === rawGroup.name);
+        const groups = parseRawToGroups(nextRaw);
+        const nextGroups = groups.map((rawGroup) => {
+          const existingGroup = finalGroups.find(
+            (g) => g.name === rawGroup.name,
+          );
+          if (!existingGroup) {
+            return {
+              vendorIndex: rawGroup.vendorIndex,
+              name: rawGroup.name,
+              deals: rawGroup.deals.map((d) => ({
+                dealId: d.dealId,
+                dealIndex: d.dealIndex,
+                urlSlug: createDealSlug(d.originalText),
+                headline: "MISSING HEADLINE",
+                description: "Needs copy. Call to speak with an agent!",
+                startDate: null,
+                endDate: null,
+                dateNote: null,
+                originalText: d.originalText,
+                isExclusive: d.isExclusive,
+                warnings: [
+                  {
+                    severity: "warn",
+                    msg: "New deal added. Generate or paste copy for this row.",
+                  },
+                ],
+                checked: false,
+              })),
+            };
+          }
+
+          const mergedDeals = rawGroup.deals.map((rawDeal) => {
+            const existingDeal = existingGroup.deals.find(
+              (d) => d.originalText === rawDeal.originalText,
+            );
+            return (
+              existingDeal || {
+                dealId: rawDeal.dealId,
+                dealIndex: rawDeal.dealIndex,
+                urlSlug: createDealSlug(rawDeal.originalText),
+                headline: "MISSING HEADLINE",
+                description: "Needs copy. Call to speak with an agent!",
+                startDate: null,
+                endDate: null,
+                dateNote: null,
+                originalText: rawDeal.originalText,
+                isExclusive: rawDeal.isExclusive,
+                warnings: [
+                  {
+                    severity: "warn",
+                    msg: "New deal added. Generate or paste copy for this row.",
+                  },
+                ],
+                checked: false,
+              }
+            );
+          });
+
           return {
             vendorIndex: rawGroup.vendorIndex,
             name: rawGroup.name,
-            deals: rawGroup.deals.map((d) => existing?.deals.find((x) => x.originalText === d.originalText) || blankDeal(d)),
+            deals: mergedDeals,
           };
         });
+        nextSessionPatch.finalGroups = nextGroups;
       }
-      updateSession(patch);
-      setQuickAdd({ vendor: "", text: "", exclusive: false });
-      setDialog(null);
+
+      updateSession(nextSessionPatch);
+
+      setQuickAddVendor("");
+      setQuickAddDealText("");
+      setQuickAddExclusive(false);
+      setShowQuickAdd(false);
       showToast("Deal added", "success");
     } catch (e) {
       showToast(e.message, "error");
     }
-  }, [rawInput, quickAdd, view, finalGroups, showToast, updateSession]);
+  }, [
+    rawInput,
+    quickAddVendor,
+    quickAddDealText,
+    quickAddExclusive,
+    view,
+    finalGroups,
+    showToast,
+    updateSession,
+  ]);
 
-  const totalDeals = finalGroups.reduce((n, g) => n + g.deals.length, 0);
-  const doneDeals = finalGroups.reduce((n, g) => n + g.deals.filter((d) => d.checked).length, 0);
-  const needsAttention = (d) => !d.checked && d.warnings?.length > 0 && !d.warningsOk;
-  const issueDeals = finalGroups.reduce((n, g) => n + g.deals.filter(needsAttention).length, 0);
+  const totalDeals = finalGroups.reduce((acc, g) => acc + g.deals.length, 0);
+  const doneDeals = finalGroups.reduce(
+    (acc, g) => acc + g.deals.filter((d) => d.checked).length,
+    0,
+  );
 
-  // "All good": the operator has looked at this deal's warnings and approves the copy.
-  const clearWarnings = useCallback((vIdx, dIdx) => {
-    updateSession((prev) => ({
-      ...prev,
-      finalGroups: prev.finalGroups.map((g, gi) => gi !== vIdx ? g : {
-        ...g,
-        deals: g.deals.map((d, di) => (di === dIdx ? { ...d, warningsOk: true } : d)),
+  const warningCounts = useMemo(() => {
+    let errors = 0;
+    let warns = 0;
+    finalGroups.forEach((g) =>
+      g.deals.forEach((d) => {
+        (d.warnings || []).forEach((w) => {
+          if (w.severity === "error") errors++;
+          else warns++;
+        });
       }),
-    }));
-  }, [updateSession]);
+    );
+    return { errors, warns };
+  }, [finalGroups]);
 
-  const matchesFilter = useCallback((deal, group) => {
-    const status = workFilter === "all" || (workFilter === "pending" && !deal.checked) || (workFilter === "done" && deal.checked) || (workFilter === "issues" && !deal.checked && deal.warnings?.length > 0 && !deal.warningsOk);
+  const matchesFilter = (deal, group) => {
+    const status = workFilter === "all" || (workFilter === "pending" && !deal.checked) || (workFilter === "done" && deal.checked) || (workFilter === "issues" && !deal.checked && deal.warnings?.length > 0);
     return status && `${group.name} ${deal.headline} ${deal.originalText}`.toLowerCase().includes(workSearch.toLowerCase());
-  }, [workFilter, workSearch]);
-
-  // The visible deals in order, each with what C would copy next.
-  const visible = useMemo(() => {
-    const rows = [];
-    finalGroups.forEach((group, vIdx) => group.deals.forEach((deal, dIdx) => {
-      if (!matchesFilter(deal, group)) return;
-      const action = (session.sourceActions || []).find((a) => a.vendor === group.name && a.text === deal.originalText);
-      // Every deal gets a fresh URL slug, updates included.
-      rows.push({ key: `${vIdx}-${dIdx}`, vIdx, dIdx, group, deal, action, showSlug: true });
-    }));
-    return rows;
-  }, [finalGroups, matchesFilter, session.sourceActions]);
-  const nextFieldOf = useCallback((row) => fieldsFor(row.deal, row.showSlug).find((f) => !copied[row.key]?.[f]) || null, [copied]);
-  const current = visible.find((r) => r.key === cursor && !r.deal.checked) || visible.find((r) => !r.deal.checked) || null;
-
-  // C copies the current deal's next field.
-  useEffect(() => {
-    if (view !== "work") return;
-    const onKey = (event) => {
-      if (event.key.toLowerCase() !== "c" || event.metaKey || event.ctrlKey || event.altKey) return;
-      if (event.target instanceof HTMLElement && ["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName)) return;
-      if (!current || dialog) return;
-      const field = nextFieldOf(current);
-      if (!field) return;
-      event.preventDefault();
-      copyField(current.vIdx, current.dIdx, current.deal, field, current.showSlug);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [view, current, dialog, nextFieldOf, copyField]);
-
-  const dialogs = <>
-    {dialog?.type === "reset" && <Dialog title="Clear the copy?" onCancel={() => setDialog(null)} onConfirm={reset} confirmText="Clear copy" danger>
-      <p>The copy and your progress in this step will be cleared.</p>
-    </Dialog>}
-    {dialog?.type === "style" && <Dialog title="House style" onConfirm={() => setDialog(null)} confirmText="Done" wide>
-      <textarea className="field-area tall" aria-label="House style" value={houseStyle} onChange={(e) => updateSession({ houseStyle: e.target.value })} spellCheck={false} />
-    </Dialog>}
-    {dialog?.type === "add" && <Dialog title="Add a deal" onCancel={() => setDialog(null)} onConfirm={addDeal} confirmText="Add deal">
-      <label className="field-label" htmlFor="qa-vendor">Supplier</label>
-      <input id="qa-vendor" className="field-input" value={quickAdd.vendor} onChange={(e) => setQuickAdd({ ...quickAdd, vendor: e.target.value })} />
-      <label className="field-label" htmlFor="qa-text">Deal text</label>
-      <textarea id="qa-text" className="field-area" value={quickAdd.text} onChange={(e) => setQuickAdd({ ...quickAdd, text: e.target.value })} spellCheck={false} />
-      <label className="check"><input type="checkbox" checked={quickAdd.exclusive} onChange={(e) => setQuickAdd({ ...quickAdd, exclusive: e.target.checked })} /> Exclusive</label>
-    </Dialog>}
-    {dialog?.type === "patch" && <Dialog title={`Paste fixed copy for ${dialog.group.name}`} onCancel={() => { setDialog(null); setPatchInput(""); }} onConfirm={applyPatch} confirmText="Apply" wide>
-      <p className="muted">From: {dialog.deal.originalText}</p>
-      <textarea className="field-area tall" aria-label="Fixed copy JSON" value={patchInput} onChange={(e) => setPatchInput(e.target.value)} spellCheck={false}
-        placeholder={'{\n  "headline": "EXCLUSIVE: Get $75 in Specialty Dining Credit",\n  "description": "Enjoy $75 in Specialty Dining Credit with this exclusive offer.",\n  "startDate": null,\n  "endDate": "03/31/2026"\n}'} />
-    </Dialog>}
-  </>;
-
+  };
   if (view === "work") {
     return (
-      <div className="publish-step">
-        {dialogs}
-        <div className="queue-head">
-          <p className="queue-count"><strong>{totalDeals - doneDeals}</strong> left to publish <span className="muted">· {doneDeals} done</span></p>
-          <div className="queue-progress" role="progressbar" aria-label="Published" aria-valuemin={0} aria-valuemax={totalDeals} aria-valuenow={doneDeals}>
-            <span style={{ width: `${totalDeals ? (doneDeals / totalDeals) * 100 : 0}%` }} />
+      <div className="copy-step">
+        <div className="copy-toolbar">
+          <div className="copy-toolbar-left">
+            <button className="btn" onClick={() => setShowReset(true)}>
+              ← Start Over
+            </button>
+            <button className="btn" onClick={() => setShowQuickAdd(true)}>
+              + Quick Add Deal
+            </button>
+            <button className="btn" onClick={() => setShowStyleEditor(true)}>
+              Edit House Style
+            </button>
           </div>
-          <div className="filters" role="group" aria-label="Show">
-            {[["pending", "To publish"], ["issues", `Needs attention${issueDeals ? ` (${issueDeals})` : ""}`], ["done", "Done"], ["all", "All"]].map(([value, label]) =>
-              <button key={value} className="filter" aria-pressed={workFilter === value} onClick={() => setWorkFilter(value)}>{label}</button>)}
-          </div>
-          <input type="search" className="field-input search" aria-label="Find a deal" placeholder="Find a deal" value={workSearch} onChange={(e) => setWorkSearch(e.target.value)} />
-        </div>
-        <div className="hint-row">
-          <p className="hint">Click any field to copy it, or press <kbd>C</kbd> to copy the next one. A deal is marked published once all its fields are copied.</p>
-          <div className="queue-links">
-            <button className="link" onClick={() => setDialog({ type: "add" })}>Add a deal</button>
-            <button className="link" onClick={() => setDialog({ type: "style" })}>House style</button>
-            <button className="link" onClick={() => setDialog({ type: "reset" })}>Clear copy</button>
+          <div className="stat-pills">
+            <span className="pill">Vendors: {finalGroups.length}</span>
+            <span className="pill pill-accent">
+              Deals: {doneDeals} / {totalDeals}
+            </span>
+            {warningCounts.errors > 0 && (
+              <span className="pill pill-bad">
+                {warningCounts.errors} errors
+              </span>
+            )}
+            {warningCounts.warns > 0 && (
+              <span className="pill pill-warn">
+                {warningCounts.warns} warnings
+              </span>
+            )}
           </div>
         </div>
 
-        {!visible.length && (totalDeals && doneDeals === totalDeals
-          ? <div className="all-done"><p>Everything is published.</p><p className="muted">{totalDeals} deals live this week.</p></div>
-          : <p className="empty">No deals in this view.</p>)}
-        {finalGroups.map((group, vIdx) => {
-          const rows = visible.filter((r) => r.vIdx === vIdx);
-          if (!rows.length) return null;
-          return (
-            <section key={group.vendorIndex || vIdx} className="supplier" aria-label={group.name}>
-              <h2 className="supplier-name">
-                <a href={`https://travelperks.com/admin/content/entries/deals?source=section%3A8d00284b-fc9e-4b3e-8f03-ab319af6f0db&search=${encodeURIComponent(group.name)}`} target="travelperks-admin" referrerPolicy="no-referrer">{group.name}<span className="visually-hidden"> (opens admin search)</span></a>
-              </h2>
-              {rows.map((row) => <DealRow
-                key={row.key}
-                row={row}
-                isCurrent={current?.key === row.key}
-                isFresh={justDone === row.key}
-                copiedFields={copied[row.key] || {}}
-                nextField={row.key === current?.key ? nextFieldOf(row) : null}
-                flash={flash}
-                note={dealNotes[row.deal.dealId || row.key] || ""}
-                onSelect={() => setCursor(row.key)}
-                onCopy={(field) => copyField(row.vIdx, row.dIdx, row.deal, field, row.showSlug)}
-                onToggle={() => toggleCheck(row.vIdx, row.dIdx)}
-                onWarningsOk={() => clearWarnings(row.vIdx, row.dIdx)}
-                onNote={(text) => updateSession({ dealNotes: { ...dealNotes, [row.deal.dealId || row.key]: text } })}
-                onFixPrompt={(note) => copyFixPrompt(row.group, row.deal, note)}
-                onPatch={() => { setDialog({ type: "patch", group: row.group, deal: row.deal }); setPatchInput(""); }}
-              />)}
-            </section>
-          );
-        })}
+        {showReset && (
+          <Modal
+            title="Start Over?"
+            onConfirm={reset}
+            onCancel={() => setShowReset(false)}
+            confirmText="Yes, Reset"
+          >
+            <p>All current progress will be lost.</p>
+          </Modal>
+        )}
+
+        {showStyleEditor && (
+          <Modal
+            title="House Style"
+            onConfirm={() => setShowStyleEditor(false)}
+            onCancel={() => setShowStyleEditor(false)}
+            confirmText="Done"
+            wide
+          >
+            <textarea
+              value={houseStyle}
+              onChange={(e) => updateSession({ houseStyle: e.target.value })}
+              className="modal-textarea"
+              spellCheck={false}
+            />
+          </Modal>
+        )}
+
+        {showQuickAdd && (
+          <Modal
+            title="Quick Add Deal"
+            onConfirm={handleQuickAdd}
+            onCancel={() => setShowQuickAdd(false)}
+            confirmText="Add Deal"
+          >
+            <div className="mini-form">
+              <label className="mini-form-label">Vendor</label>
+              <input
+                className="mini-input"
+                value={quickAddVendor}
+                onChange={(e) => setQuickAddVendor(e.target.value)}
+              />
+              <label className="mini-form-label">Deal text</label>
+              <textarea
+                className="modal-textarea modal-textarea-short"
+                value={quickAddDealText}
+                onChange={(e) => setQuickAddDealText(e.target.value)}
+                spellCheck={false}
+              />
+              <label className="toggle">
+                <input
+                  type="checkbox"
+                  checked={quickAddExclusive}
+                  onChange={(e) => setQuickAddExclusive(e.target.checked)}
+                />
+                Mark as exclusive
+              </label>
+            </div>
+          </Modal>
+        )}
+
+        {patchModal && (
+          <Modal
+            title={`Patch ${patchModal.deal.dealId}`}
+            onConfirm={handlePatchApply}
+            onCancel={() => {
+              setPatchModal(null);
+              setPatchInput("");
+            }}
+            confirmText="Apply Patch"
+            wide
+          >
+            <div className="patch-context">
+              <div className="patch-source">
+                <strong>Source:</strong> {patchModal.deal.originalText}
+              </div>
+              <div className="patch-current">
+                <strong>Current headline:</strong> {patchModal.deal.headline}
+              </div>
+              <div className="patch-current">
+                <strong>Current description:</strong>{" "}
+                {patchModal.deal.description}
+              </div>
+            </div>
+            <textarea
+              className="modal-textarea"
+              value={patchInput}
+              onChange={(e) => setPatchInput(e.target.value)}
+              placeholder={`Paste a mini patch, for example:
+{
+  "headline": "EXCLUSIVE: Get $75 in Specialty Dining Credit",
+  "description": "Enjoy $75 in Specialty Dining Credit with this exclusive offer.",
+  "startDate": null,
+  "endDate": "03/31/2026"
+}`}
+              spellCheck={false}
+            />
+          </Modal>
+        )}
+
+        <div className="review-toolbar copy-review-toolbar">
+          <div className="review-tabs">{[["pending", "To publish"], ["issues", "Needs attention"], ["done", "Done"], ["all", "All deals"]].map(([value, label]) => <button key={value} className={`btn ${workFilter === value ? 'btn-accent' : ''}`} onClick={() => setWorkFilter(value)}>{label}</button>)}</div>
+          <label className="review-search">Find a deal<input value={workSearch} onChange={e => setWorkSearch(e.target.value)} placeholder="Supplier or offer…" /></label>
+          <span className="pill">{totalDeals - doneDeals} left to publish</span>
+        </div>
+        <p className="review-hint">Copy each field, paste it into the website, then mark the deal done. Copying a description does not mark it published.</p>
+        {!finalGroups.some(g => g.deals.some(d => matchesFilter(d, g))) && <div className="dedupe-empty"><h3>No deals in this view</h3><p>Choose another filter or clear your search.</p></div>}
+        {finalGroups.map((group, vIdx) => group.deals.some(deal => matchesFilter(deal, group)) && (
+          <div key={group.vendorIndex || vIdx} className="vendor-block">
+            <h2 className="vendor-block-title">
+              <a
+                className="vendor-block-link"
+                href={`https://travelperks.com/admin/content/entries/deals?source=section%3A8d00284b-fc9e-4b3e-8f03-ab319af6f0db&search=${encodeURIComponent(group.name)}`}
+                target="travelperks-admin"
+                referrerPolicy="no-referrer"
+                title={`Search "${group.name}" in TravelPerks admin`}
+              >
+                {group.name}
+              </a>
+            </h2>
+            <div className="deal-list">
+              {group.deals.map((deal, dIdx) => {
+                if (!matchesFilter(deal, group)) return null;
+                const sourceAction = (session.sourceActions || []).find(item => item.vendor === group.name && item.text === deal.originalText);
+                const showSlug = sourceAction?.action !== "update";
+                const noteKey = deal.dealId || `${vIdx}-${dIdx}`;
+                return (
+                  <div
+                    key={deal.dealId || dIdx}
+                    className={`deal-row ${deal.checked ? "deal-checked" : ""}`}
+                  >
+                    <button
+                      aria-label={deal.checked ? "Mark deal unfinished" : "Mark deal published"}
+                      title={deal.checked ? "Mark unfinished" : "Mark published"}
+                      className="deal-check"
+                      onClick={() => toggleCheck(vIdx, dIdx)}
+                    >
+                      <div
+                        className={`circle-check ${deal.checked ? "circle-active" : ""}`}
+                      >
+                        {deal.checked && "✓"}
+                      </div>
+                    </button>
+
+                    <div className="deal-content">
+                      {deal.warnings && deal.warnings.length > 0 && (
+                        <div className="deal-warnings">
+                          {deal.warnings.map((w, wi) => (
+                            <div
+                              key={wi}
+                              className={`deal-warning deal-warning-${w.severity}`}
+                            >
+                              {w.severity === "error" ? "🚨" : "⚠️"} {w.msg}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {sourceAction?.action === 'update' && <div className="comparison-alert">Update existing website deal: <a href={`https://travelperks.com/admin/content/entries/deals?source=section%3A8d00284b-fc9e-4b3e-8f03-ab319af6f0db&search=${encodeURIComponent(sourceAction.websiteTitle || group.name)}`} target="travelperks-admin" rel="noreferrer">{sourceAction.websiteTitle || group.name} ↗</a> · Keep its existing URL.</div>}
+                      <div className="deal-meta-row">
+                        <span className="pill">{deal.dealId}</span>
+                        {deal.isExclusive && (
+                          <span className="pill pill-bad">EXCLUSIVE</span>
+                        )}
+                      </div>
+
+                      <div className="deal-line">
+                        <span
+                          className={`copy-text deal-headline ${deal.isExclusive ? "deal-exclusive" : ""}`}
+                          onClick={() =>
+                            handleCopy(deal.headline, `h-${vIdx}-${dIdx}`, {
+                              field: "h",
+                              vIdx,
+                              dIdx,
+                              deal,
+                              showSlug,
+                            })
+                          }
+                        >
+                          {deal.headline}
+                        </span>
+                        {copySuccess[`h-${vIdx}-${dIdx}`] && (
+                          <span className="copied-badge">Copied</span>
+                        )}
+                      </div>
+
+                      <div className="deal-line">
+                        <span
+                          className="copy-text deal-desc"
+                          onClick={() =>
+                            handleCopy(
+                              deal.description,
+                              `d-${vIdx}-${dIdx}`,
+                              { field: "d", vIdx, dIdx, deal, showSlug },
+                            )
+                          }
+                        >
+                          {deal.description}
+                        </span>
+                        {copySuccess[`d-${vIdx}-${dIdx}`] && (
+                          <span className="copied-badge">Copied</span>
+                        )}
+                      </div>
+
+                      <div className="original-context">
+                        <span className="context-label">ORIGINAL:</span>{" "}
+                        {deal.originalText}
+                      </div>
+
+                      <div className="dates-row">
+                        {deal.startDate && (
+                          <button
+                            className="date-pill date-start"
+                            onClick={() =>
+                              handleCopy(deal.startDate, `sd-${vIdx}-${dIdx}`, { field: "sd", vIdx, dIdx, deal, showSlug })
+                            }
+                          >
+                            Copy start: {deal.startDate}
+                          </button>
+                        )}
+                        {deal.endDate && (
+                          <button
+                            className="date-pill date-end"
+                            onClick={() =>
+                              handleCopy(deal.endDate, `ed-${vIdx}-${dIdx}`, { field: "ed", vIdx, dIdx, deal, showSlug })
+                            }
+                          >
+                            Copy end: {deal.endDate}
+                          </button>
+                        )}
+                        {showSlug && <button
+                          className="date-pill slug-pill"
+                          title="Click to copy URL slug"
+                          onClick={() =>
+                            handleCopy(deal.urlSlug, `slug-${vIdx}-${dIdx}`, { field: "slug", vIdx, dIdx, deal, showSlug })
+                          }
+                        >
+                          Copy URL slug · {deal.urlSlug}
+                        </button>}
+                        {(copySuccess[`sd-${vIdx}-${dIdx}`] ||
+                          copySuccess[`ed-${vIdx}-${dIdx}`] ||
+                          copySuccess[`slug-${vIdx}-${dIdx}`]) && (
+                          <span className="copied-badge">Copied</span>
+                        )}
+                      </div>
+
+                      <div className="publish-fields">
+                        <button className="btn btn-success btn-small" onClick={() => toggleCheck(vIdx, dIdx)}>{deal.checked ? 'Reopen deal' : 'Mark published ✓'}</button>
+                      </div>
+                      <div className="deal-actions">
+                        <button
+                          className="btn btn-small"
+                          onClick={() =>
+                            handleSingleDealPrompt(group, deal, "")
+                          }
+                        >
+                          Copy Fix Prompt
+                        </button>
+                        <button
+                          className="btn btn-small"
+                          onClick={() =>
+                            setExpandedNotes((prev) => ({
+                              ...prev,
+                              [noteKey]: !prev[noteKey],
+                            }))
+                          }
+                        >
+                          {expandedNotes[noteKey]
+                            ? "Hide Notes"
+                            : "Fix Prompt + Note"}
+                        </button>
+                        <button
+                          className="btn btn-small"
+                          onClick={() => {
+                            setPatchModal({ group, deal });
+                            setPatchInput("");
+                          }}
+                        >
+                          Paste Patch JSON
+                        </button>
+                      </div>
+
+                      {expandedNotes[noteKey] && (
+                        <div className="deal-note-box">
+                          <textarea
+                            className="deal-note-input"
+                            value={dealNotes[noteKey] || ""}
+                            onChange={(e) =>
+                              updateSession({
+                                dealNotes: {
+                                  ...dealNotes,
+                                  [noteKey]: e.target.value,
+                                },
+                              })
+                            }
+                            placeholder="Example: make this more customer-facing, use a stronger CTA, don't say member offer"
+                            spellCheck={false}
+                          />
+                          <div className="deal-note-actions">
+                            <button
+                              className="btn btn-small btn-accent"
+                              onClick={() =>
+                                handleSingleDealPrompt(
+                                  group,
+                                  deal,
+                                  dealNotes[noteKey] || "",
+                                )
+                              }
+                            >
+                              Copy Prompt with Note
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))}
       </div>
     );
   }
 
   return (
-    <div className="publish-step">
-      {dialogs}
-      <div className="pair">
-        <section className="pair-side" aria-labelledby="pub-in">
-          <div className="pair-head">
-            <h2 id="pub-in"><span className="step-num" aria-hidden="true">1</span>Copy the prompt</h2>
-            <p className="muted">{rawDealCount} deals from {rawGroups.length} suppliers</p>
-          </div>
-          <textarea className="pair-body source" aria-labelledby="pub-in" value={rawInput} onChange={(e) => updateSession({ rawInput: e.target.value })} placeholder={"v\tSupplier\nd\tDeal text"} spellCheck={false} />
-          <div className="side-actions">
-            <button className="btn btn-primary" onClick={handleGeneratePrompt} disabled={!rawGroups.length}>Copy prompt</button>
-          </div>
-        </section>
+    <div className="copy-step">
+      {validationError && (
+        <Modal
+          title={validationError.title}
+          onConfirm={() => setValidationError(null)}
+          confirmText="OK, I'll Fix It"
+        >
+          <p>{validationError.msg}</p>
+          {validationError.details && (
+            <ul className="error-list">
+              {validationError.details.map((d, i) => (
+                <li key={i}>{d}</li>
+              ))}
+            </ul>
+          )}
+        </Modal>
+      )}
 
-        <section className="pair-side" aria-labelledby="pub-out">
-          <div className="pair-head">
-            <h2 id="pub-out"><span className="step-num" aria-hidden="true">2</span>Paste the AI's reply</h2>
-            <p className="muted">It's checked as soon as you paste it.</p>
+      {validationWarnings && (
+        <div className="modal-overlay">
+          <div className="modal modal-wide">
+            <h3>⚠ Review Before Proceeding</h3>
+            <div className="modal-body">
+              <p className="gate-intro">
+                The AI output has {validationWarnings.length} item
+                {validationWarnings.length > 1 ? "s" : ""} that need your
+                attention. Review each one, then decide whether to proceed or go
+                back and fix the JSON.
+              </p>
+
+              <div className="gate-warnings">
+                {validationWarnings.map((item, i) => (
+                  <div key={i} className="gate-item">
+                    <div className="gate-item-header">
+                      <strong>{item.vendorName}</strong> — Deal {item.dealIdx}
+                    </div>
+                    {item.headline && (
+                      <div className="gate-headline">
+                        Headline: {item.headline}
+                      </div>
+                    )}
+                    {item.description && (
+                      <div className="gate-desc">
+                        Description: {item.description}
+                      </div>
+                    )}
+                    <div className="gate-source">Source: {item.dealText}</div>
+                    {item.warnings.map((w, wi) => (
+                      <div
+                        key={wi}
+                        className={`gate-warning gate-warning-${w.severity}`}
+                      >
+                        {w.severity === "error" ? "🚨" : "⚠️"} {w.msg}
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button className="btn" onClick={handleCancelGate}>
+                ← Go Back & Fix JSON
+              </button>
+              <button
+                className="btn btn-accent"
+                onClick={handleProceedPastGate}
+              >
+                I've Reviewed — Proceed Anyway →
+              </button>
+            </div>
           </div>
-          <textarea className="pair-body source" aria-labelledby="pub-out" aria-describedby="pub-check" value={jsonInput} onChange={(e) => updateSession({ jsonInput: e.target.value })} placeholder="Paste the reply here." spellCheck={false} />
-          <div id="pub-check" className="check-result" aria-live="polite">
-            {checkResult?.error && <div className="notice notice-error">
-              <p><strong>{checkResult.error.title}.</strong> {checkResult.error.msg}</p>
-              {checkResult.error.details && <ul>{checkResult.error.details.map((d, i) => <li key={i}>{d}</li>)}</ul>}
-            </div>}
-            {checkResult?.warnings && <div className="notice notice-warn">
-              <p><strong>{checkResult.warnings.length === 1 ? "1 deal needs" : `${checkResult.warnings.length} deals need`} a look.</strong> You can fix these in the queue too.</p>
-              <ul>{checkResult.warnings.map((item, i) => <li key={i}><strong>{item.vendorName}</strong> {item.headline || item.dealText}: {item.warnings.map((w) => w.msg).join("; ")}</li>)}</ul>
-              <button className="btn btn-primary" onClick={() => openQueue(checkResult.data)}>Open the queue anyway</button>
-            </div>}
-          </div>
-        </section>
+        </div>
+      )}
+
+      <div className="copy-toolbar">
+        <div className="copy-toolbar-left">
+          <button className="btn" onClick={() => setShowQuickAdd(true)}>
+            + Quick Add Deal
+          </button>
+          <button className="btn" onClick={() => setShowStyleEditor(true)}>
+            Edit House Style
+          </button>
+        </div>
       </div>
-      <div className="step-actions">
-        <button className="link" onClick={() => setDialog({ type: "add" })}>Add a deal</button>
-        <button className="link" onClick={() => setDialog({ type: "style" })}>House style</button>
+
+      {showStyleEditor && (
+        <Modal
+          title="House Style"
+          onConfirm={() => setShowStyleEditor(false)}
+          onCancel={() => setShowStyleEditor(false)}
+          confirmText="Done"
+          wide
+        >
+          <textarea
+            value={houseStyle}
+            onChange={(e) => updateSession({ houseStyle: e.target.value })}
+            className="modal-textarea"
+            spellCheck={false}
+          />
+        </Modal>
+      )}
+
+      {showQuickAdd && (
+        <Modal
+          title="Quick Add Deal"
+          onConfirm={handleQuickAdd}
+          onCancel={() => setShowQuickAdd(false)}
+          confirmText="Add Deal"
+        >
+          <div className="mini-form">
+            <label className="mini-form-label">Vendor</label>
+            <input
+              className="mini-input"
+              value={quickAddVendor}
+              onChange={(e) => setQuickAddVendor(e.target.value)}
+            />
+            <label className="mini-form-label">Deal text</label>
+            <textarea
+              className="modal-textarea modal-textarea-short"
+              value={quickAddDealText}
+              onChange={(e) => setQuickAddDealText(e.target.value)}
+              spellCheck={false}
+            />
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={quickAddExclusive}
+                onChange={(e) => setQuickAddExclusive(e.target.checked)}
+              />
+              Mark as exclusive
+            </label>
+          </div>
+        </Modal>
+      )}
+
+      <div className="two-col">
+        <div className="panel">
+          <div className="panel-header">
+            <div className="badge-circle">1</div>
+            <h2>1. Get copy for your action list</h2>
+          </div>
+          <div className="panel-body">
+            <textarea
+              value={rawInput}
+              onChange={(e) => updateSession({ rawInput: e.target.value })}
+              placeholder="v Vendor Name&#10;d Deal text..."
+              spellCheck={false}
+            />
+          </div>
+          <div className="panel-footer">
+            <button
+              className="btn btn-accent full-width"
+              onClick={handleGeneratePrompt}
+            >
+              Copy Batch Prompt
+            </button>
+          </div>
+        </div>
+
+        <div className="panel">
+          <div className="panel-header">
+            <div className="badge-circle">2</div>
+            <h2>2. Check the AI response</h2>
+          </div>
+          <div className="panel-body">
+            <textarea
+              value={jsonInput}
+              onChange={(e) => updateSession({ jsonInput: e.target.value })}
+              placeholder="Paste JSON here..."
+              spellCheck={false}
+            />
+          </div>
+          <div className="panel-footer">
+            <button
+              className="btn btn-success full-width"
+              onClick={handleValidate}
+              disabled={!jsonInput}
+            >
+              Check copy & open publishing queue
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );
 }
 
-/** One deal in the publishing queue: fields to copy, its source, and quiet fix tools. */
-function DealRow({ row, isCurrent, isFresh, copiedFields, nextField, flash, note, onSelect, onCopy, onToggle, onWarningsOk, onNote, onFixPrompt, onPatch }) {
-  const { deal, showSlug, key } = row;
-  const fieldButton = (field, className, content) => (
-    <button
-      className={`copyable ${className} ${copiedFields[field] ? "is-copied" : ""} ${nextField === field ? "is-next" : ""} ${flash === `${key}-${field}` ? "is-flash" : ""}`}
-      onClick={(e) => { e.stopPropagation(); onCopy(field); }}
-      aria-label={`Copy ${FIELD_LABEL[field]}: ${valueOf(deal, field)}`}
-    >
-      {content}
-      {flash === `${key}-${field}` && <span className="copied-note" aria-hidden="true">Copied</span>}
-    </button>
-  );
+function Modal({
+  title,
+  children,
+  onConfirm,
+  onCancel,
+  confirmText = "Confirm",
+  wide = false,
+}: {
+  title?: any;
+  children?: any;
+  onConfirm?: () => void;
+  onCancel?: () => void;
+  confirmText?: string;
+  wide?: boolean;
+}) {
   return (
-    <article data-deal-key={key} className={`deal ${isCurrent ? "is-current" : ""} ${deal.checked ? "is-done" : ""} ${isFresh && deal.checked ? "is-fresh" : ""}`} onClick={onSelect}>
-      <button
-        className="deal-check"
-        aria-pressed={!!deal.checked}
-        aria-label={deal.checked ? `Published: ${deal.headline}. Mark not published` : `Mark published: ${deal.headline}`}
-        onClick={(e) => { e.stopPropagation(); onToggle(); }}
-      >
-        <span aria-hidden="true">{deal.checked ? "✓" : ""}</span>
-      </button>
-      <div className="deal-body">
-        {fieldButton("h", "deal-headline", deal.headline)}
-        {fieldButton("d", "deal-desc", deal.description)}
-        <div className="deal-fields">
-          {deal.startDate && fieldButton("sd", "chip chip-date", <>Start {deal.startDate}</>)}
-          {deal.endDate && fieldButton("ed", "chip chip-date", <>End {deal.endDate}</>)}
-          {showSlug && deal.urlSlug && fieldButton("slug", "chip chip-mono", deal.urlSlug)}
-        </div>
-        {deal.warnings?.length > 0 && !deal.warningsOk && <div className="deal-warnings">
-          <ul>{deal.warnings.map((w, i) => <li key={i} className={w.severity === "error" ? "is-error" : ""}><span className="label">{w.severity === "error" ? "Error" : "Check"}</span> {w.msg}</li>)}</ul>
-          <button className="deal-warnings-ok" onClick={(e) => { e.stopPropagation(); onWarningsOk(); }}>All good ✓</button>
-        </div>}
-        <p className="deal-source">From: {deal.originalText}{deal.isExclusive && <span className="label label-exclusive">Exclusive</span>}</p>
-        <details className="deal-fix" onClick={(e) => e.stopPropagation()}>
-          <summary>Fix this copy</summary>
-          <textarea className="field-area" aria-label="Note for the fix prompt" value={note} onChange={(e) => onNote(e.target.value)} placeholder="Optional note, e.g. make it more customer-facing" spellCheck={false} />
-          <div className="fix-actions">
-            <button className="btn" onClick={() => onFixPrompt(note)}>Copy fix prompt</button>
-            <button className="btn" onClick={onPatch}>Paste fixed copy</button>
-          </div>
-        </details>
-      </div>
-    </article>
-  );
-}
-
-function Dialog({ title, children, onConfirm, onCancel = null, confirmText = "Confirm", wide = false, danger = false }) {
-  useEffect(() => {
-    const onKey = (event) => { if (event.key === "Escape") (onCancel || onConfirm)(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onCancel, onConfirm]);
-  return (
-    <div className="dialog-backdrop">
-      <div className={`dialog ${wide ? "is-wide" : ""}`} role="dialog" aria-modal="true" aria-label={title}>
-        <h2>{title}</h2>
-        {children}
-        <div className="dialog-actions">
-          {onCancel && <button className="btn" onClick={onCancel}>Cancel</button>}
-          <button className={`btn ${danger ? "btn-danger" : "btn-primary"}`} onClick={onConfirm} autoFocus>{confirmText}</button>
+    <div className="modal-overlay">
+      <div className={`modal ${wide ? "modal-wide" : ""}`}>
+        <h3>{title}</h3>
+        <div className="modal-body">{children}</div>
+        <div className="modal-actions">
+          {onCancel && (
+            <button className="btn" onClick={onCancel}>
+              Cancel
+            </button>
+          )}
+          {onConfirm && (
+            <button className="btn btn-accent" onClick={onConfirm}>
+              {confirmText}
+            </button>
+          )}
         </div>
       </div>
     </div>

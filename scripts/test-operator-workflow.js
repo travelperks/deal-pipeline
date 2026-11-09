@@ -1,44 +1,29 @@
 import assert from 'node:assert/strict';
-import { buildReviewQueue } from '../src/logic/review.js';
+import { buildReviewQueue, dateChange } from '../src/logic/review.js';
 import { categorizeDedupeResults, exportUnmatched } from '../src/logic/dedupe.js';
-import { buildPublishHandoff, applyDecisions } from '../src/logic/jev.js';
 import { validateDeal } from '../src/logic/copywriting.js';
 
-const today = new Date(2026, 9, 13);
 const rows = [
-  { hq: { id: 1, vendor: 'Carnival', text: 'Save 20%', end: new Date(2026, 9, 20) }, web: {}, meta: { verdict: 'update' } },
-  { hq: { id: 2, vendor: 'Carnival', text: 'Free drinks' }, web: {}, meta: { verdict: 'on-site' } },
-  { hq: { id: 3, vendor: 'Carnival', text: 'New offer' }, web: null, meta: { verdict: 'new' } },
-  { hq: { id: 4, vendor: 'Carnival', text: 'Unsure offer' }, web: {}, meta: { verdict: 'update', guess: true } },
-  { hq: { id: 5, vendor: 'Carnival', text: 'Last day', end: today }, web: null, meta: { verdict: 'new' } },
+  { hq: { id: 1, vendor: 'Carnival', text: 'Save 20%', end: new Date(2026, 9, 10) }, web: { expiryDate: new Date(2026, 9, 1) }, meta: { identical: false, differences: ['expiry'] } },
+  { hq: { id: 2, vendor: 'Carnival', text: 'Free drinks' }, web: {}, meta: { identical: true, differences: [] } },
+  { hq: { id: 3, vendor: 'Carnival', text: 'New offer' }, web: null, meta: { identical: false, differences: [] } },
 ];
-const categories = categorizeDedupeResults(rows, { today });
-const ids = list => list.map(r => r.hq.id);
+const categories = categorizeDedupeResults(rows);
 let queue = buildReviewQueue(categories);
-assert.equal(queue.ask, undefined, 'Nothing ever waits on the operator');
-assert.deepEqual(ids(queue.update), [1, 4], 'Best guesses go forward as updates');
-assert.deepEqual(ids(queue.added), [3], 'Nothing-similar rows go straight through as new');
-assert.deepEqual(ids(queue.onSite), [2]);
-assert.deepEqual(ids(queue.excluded), [5], 'Ending today is always excluded');
-queue = buildReviewQueue(categories, { 2: 'new', 1: 'on-site' });
-assert.deepEqual(ids(queue.update), [4]);
-assert.deepEqual(ids(queue.added), [2, 3]);
-assert.deepEqual(ids(queue.onSite), [1]);
-assert.deepEqual(ids(buildReviewQueue(categories, { 3: 'update' }).added), [3], 'A row with no website deal cannot become an update');
-const payload = exportUnmatched([...queue.update, ...queue.added].map(r => r.hq));
+assert.deepEqual(queue.pending.map(r => r.hq.id), [2], 'Identical rows are pre-checked and wait for confirmation');
+assert.deepEqual(queue.work.map(r => r.hq.id), [1, 3], 'Extensions and new deals go straight to the work list');
+queue = buildReviewQueue(categories, { 2: 'skip' });
+assert.equal(queue.pending.length, 0);
+const payload = exportUnmatched(queue.work.map(r => r.hq));
+assert.ok(payload.includes('Save 20%'));
 assert.ok(payload.includes('New offer'));
-assert.ok(!payload.includes('Save 20%'), 'On-site deals never enter the publish payload');
-assert.ok(!payload.includes('Last day'), 'Ending-today deals never enter the publish payload');
-
-const suspicious = { hq: { id: 101, vendor: 'Carnival', type: 'exclusive', text: 'EXCLUSIVE 10% savings' }, web: null, meta: { verdict: 'new', reviewReason: 'matching-terms', candidates: [], reviewCandidates: [{}] } };
-const ready = { hq: { id: 102, vendor: 'Carnival', type: 'deal', text: 'Save 25%' }, web: null, meta: { verdict: 'new', candidates: [] } };
-assert.equal(buildPublishHandoff(categorizeDedupeResults([ready, suspicious], { today })), null, 'A ready deal must not carry an unresolved suspect deal across Publish');
-const approved = applyDecisions([ready, suspicious], { 101: { verdict: 'new' } }, []);
-const handoff = buildPublishHandoff(categorizeDedupeResults(approved, { today }));
-assert.ok(handoff.text.includes('EXCLUSIVE 10% savings'));
-assert.equal(handoff.actions.length, 2);
-const duplicatePayload = exportUnmatched([ready.hq, { ...ready.hq, id: 103 }]);
-assert.equal(duplicatePayload.split('\n').filter(line => line.startsWith('d\t')).length, 1, 'Duplicate offers must not survive the Publish serialization boundary');
+assert.ok(!payload.includes('Free drinks'), 'Confirmed identical deals must never enter the copy payload');
+assert.equal(queue.work.length + queue.skipped.length + queue.pending.length, rows.length);
+assert.deepEqual(buildReviewQueue(categories, { 2: 'work' }).work.map(r => r.hq.id), [1, 2, 3], 'A pre-checked row can be pulled into the work list');
+assert.deepEqual(buildReviewQueue(categories, { 1: 'skip' }).skipped.map(r => r.hq.id), [1], 'A work row can be set aside as already on site');
+assert.equal(buildReviewQueue(categories, {}).pending[0].hq.id, 2, 'Undo restores the pre-check');
+assert.ok(dateChange(rows[0]));
+assert.equal(dateChange({ ...rows[0], web: { expiryDate: rows[0].hq.end } }), '');
 
 const source = { originalText: 'Save 20% on your cruise', isExclusive: false };
 const clean = { headline: 'Save 20% on your cruise', description: 'Enjoy your next cruise for less.' };
@@ -47,4 +32,4 @@ assert.ok(validateDeal({ ...clean, headline: ' ' }, source).some(w => w.ruleId =
 assert.ok(validateDeal({ ...clean, endDate: '2/30/27' }, source).some(w => w.ruleId === 'COPY.INVALID_DATE'));
 assert.ok(validateDeal({ ...clean, startDate: '10/10/26', endDate: '10/1/26' }, source).some(w => w.ruleId === 'COPY.DATE_ORDER'));
 assert.ok(!validateDeal({ ...clean, endDate: '2/29/28' }, source).some(w => w.ruleId === 'COPY.INVALID_DATE'));
-console.log('Operator verdict queue, overrides, copy routing, and precise lint checks: PASS');
+console.log('Operator review, copy routing, undo, and precise lint checks: PASS');

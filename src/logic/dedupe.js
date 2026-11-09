@@ -21,30 +21,6 @@ function parseYear(y) {
   return n;
 }
 
-function digitOrders(s) {
-  if (s.length <= 1) return [s];
-  const out = new Set();
-  [...s].forEach((c, i) => {
-    for (const rest of digitOrders(s.slice(0, i) + s.slice(i + 1))) out.add(c + rest);
-  });
-  return [...out];
-}
-
-// Nobody books a cruise a century out: a year more than a few years ahead is
-// a typo ("2206" for "2026"), corrected to the nearest plausible reordering of
-// its digits. Returns the year to use and, when corrected, the edit made.
-function plausibleYear(raw) {
-  const y = parseYear(raw);
-  const now = new Date().getFullYear();
-  if (y === null || y <= now + 3) return { year: y, correction: null };
-  const fixes = digitOrders(raw.replace(/\D/g, ''))
-    .map(order => ({ order, year: parseYear(order) }))
-    .filter(f => f.year >= now - 1 && f.year <= now + 3)
-    .sort((a, b) => Math.abs(a.year - now) - Math.abs(b.year - now));
-  if (!fixes.length) return { year: null, correction: null };
-  return { year: fixes[0].year, correction: { from: raw, to: fixes[0].order } };
-}
-
 function toLA(m, d, y) { return new Date(y, m - 1, d, 12, 0, 0); }
 function startOfDay(d) { const x = new Date(d); x.setHours(0,0,0,0); return x; }
 function endOfDay(d) { const x = new Date(d); x.setHours(23,59,59,999); return x; }
@@ -61,12 +37,11 @@ export function sameDay(a, b) {
  * Extracts the booking window encoded in terse HQ deal text using Los Angeles
  * calendar semantics. Ongoing offers have no end date, malformed years become
  * `dateWarning` evidence instead of guessed dates, and an omitted year rolls
- * forward only when the inferred date would otherwise already be past. A
- * far-future year typo is corrected and reported as `yearCorrection`.
+ * forward only when the inferred date would otherwise already be past.
  */
 export function parseHQDates(text) {
   const t = text.toLowerCase();
-  const out = { start: null, end: null, ongoing: false, dateWarning: null, yearCorrection: null };
+  const out = { start: null, end: null, ongoing: false, dateWarning: null };
 
   if (/ongoing/.test(t)) { out.ongoing = true; return out; }
   if (/today/.test(t)) { out.end = endOfDay(new Date()); return out; }
@@ -75,14 +50,12 @@ export function parseHQDates(text) {
     /(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\s*[-–]\s*(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?/
   );
   if (range) {
-    const end = plausibleYear(range[6]);
-    let y2 = end.year;
-    let y1 = range[3] ? plausibleYear(range[3]).year : y2;
+    let y2 = parseYear(range[6]);
+    let y1 = parseYear(range[3] ?? range[6]);
     if ((range[3] && y1 === null) || (range[6] && y2 === null)) {
       out.dateWarning = `Could not parse year in date range: "${range[0]}"`;
       return out;
     }
-    out.yearCorrection = end.correction;
     if (y2 === null) {
       // No year written: assume the current year, rolling forward only when
       // the end date would otherwise already be past.
@@ -98,13 +71,11 @@ export function parseHQDates(text) {
 
   const single = t.match(/ends?\s+(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?/);
   if (single) {
-    const fixed = plausibleYear(single[3]);
-    let y = fixed.year;
+    let y = parseYear(single[3]);
     if (single[3] && y === null) {
       out.dateWarning = `Possible typo in year: "${single[3]}" in "${single[0]}"`;
       return out;
     }
-    out.yearCorrection = fixed.correction;
     if (!single[3] || y === null) {
       const tent = toLA(+single[1], +single[2], new Date().getFullYear());
       y = tent < startOfDay(new Date()) ? new Date().getFullYear() + 1 : new Date().getFullYear();
@@ -116,13 +87,11 @@ export function parseHQDates(text) {
   const any = [...t.matchAll(/(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?/g)];
   if (any.length) {
     const last = any[any.length - 1];
-    const fixed = plausibleYear(last[3]);
-    const y = fixed.year;
+    const y = parseYear(last[3]);
     if (last[3] && y === null) {
       out.dateWarning = `Possible typo in year: "${last[3]}"`;
       return out;
     }
-    out.yearCorrection = fixed.correction;
     out.end = endOfDay(toLA(+last[1], +last[2], y || new Date().getFullYear()));
   }
   return out;
@@ -269,7 +238,7 @@ function compareExpiry(hq, web) {
  * result is a checklist in the operator's order, an internal rank used only to
  * pick the best sibling per supplier, and `identical` when nothing differs.
  */
-export function compareMarkers(hq, web) {
+function compareMarkers(hq, web) {
   const H = hq.markers, W = web.markers;
   const typeStatus = compareTypes(H.types, W.types);
   const checks = [
@@ -283,9 +252,7 @@ export function compareMarkers(hq, web) {
 
   const by = Object.fromEntries(checks.map(c => [c.key, c.status]));
   const sameKind = typeStatus === 'same' || (typeStatus === 'unknown' && by.dollars === 'same');
-  // An exclusive deal and a public one are never the same deal, however
-  // similar the wording.
-  const sibling = by.exclusive === 'same' && (sameKind || typeStatus === 'partial');
+  const sibling = sameKind || typeStatus === 'partial';
 
   // Rank only decides which website deal is shown beside the incoming one.
   let rank = 0;
@@ -303,9 +270,8 @@ export function compareMarkers(hq, web) {
     if (days <= 90) rank += 3;
   }
 
-  const identical = sibling && sameKind && checks.every(c => c.status === 'same' || c.status === 'n/a' || (c.key === 'type' && c.status === 'unknown'));
+  const identical = sameKind && checks.every(c => c.status === 'same' || c.status === 'n/a' || (c.key === 'type' && c.status === 'unknown'));
   const differences = checks.filter(c => c.status === 'different').map(c => c.key);
-  const changes = describeChanges(hq, web, typeStatus);
 
   return {
     score: sibling ? Math.max(rank, 1) : 0,
@@ -314,58 +280,8 @@ export function compareMarkers(hq, web) {
     typeStatus,
     checks,
     differences,
-    changes,
-    verdict: !sibling ? 'new' : identical ? 'on-site' : 'update',
-    guess: sibling && !identical && isGuess(H, W, typeStatus, sameKind),
     candidateRankings: [],
   };
-}
-
-const FIGURES = [
-  ['dollars', 'Amount', v => `$${v.toLocaleString('en-US')}`],
-  ['percents', 'Percent', v => `${v}%`],
-  ['nights', 'Nights', v => `${v} nights`],
-];
-
-// A figure conflicts when both sides state one and they disagree; a figure
-// only one side states is an addition or a drop, not a conflict.
-function conflictingFigures(H, W) {
-  return FIGURES.filter(([k]) => H[k].size && W[k].size && !setsEqual(H[k], W[k])).map(([k]) => k);
-}
-
-/**
- * The operator's rule for a same-exclusivity sibling: the same kind of offer
- * is the same deal whatever changed (money, percent, expiry), so it is an
- * update. A partly-overlapping kind is an update too; when the two also
- * disagree on stated figures the update is only a best guess.
- */
-function isGuess(H, W, typeStatus, sameKind) {
-  return !sameKind && !(typeStatus === 'partial' && !conflictingFigures(H, W).length);
-}
-
-/** Short operator-facing lines naming what an update would change. */
-function describeChanges(hq, web, typeStatus) {
-  const H = hq.markers, W = web.markers;
-  const out = [];
-  if (hq.yearCorrection) out.push(`Year typo ${hq.yearCorrection.from} read as ${hq.yearCorrection.to}`);
-  if (typeStatus === 'partial' || typeStatus === 'different') {
-    const adds = [...H.types].filter(t => !W.types.has(t));
-    const drops = [...W.types].filter(t => !H.types.has(t));
-    if (adds.length) out.push(`Adds ${describeTypes(adds)}`);
-    if (drops.length) out.push(`Site also has ${describeTypes(drops)}`);
-  }
-  for (const [k, label, fmt] of FIGURES) {
-    const h = [...H[k]].sort((a, b) => a - b), w = [...W[k]].sort((a, b) => a - b);
-    if (setsEqual(H[k], W[k])) continue;
-    if (h.length && w.length) out.push(`${label} ${w.map(fmt).join(', ')} → ${h.map(fmt).join(', ')}`);
-    else if (h.length) out.push(`Adds ${h.map(fmt).join(', ')}`);
-    else out.push(`Drops ${w.map(fmt).join(', ')}`);
-  }
-  const webEnd = web.expiryDate ? dateFmt.format(web.expiryDate) : null;
-  if (hq.ongoing && webEnd) out.push(`Ongoing — push site expiry past ${webEnd}`);
-  else if (hq.end && !webEnd) out.push(`Adds expiry ${dateFmt.format(hq.end)}`);
-  else if (hq.end && webEnd && !sameDay(hq.end, web.expiryDate)) out.push(`Expiry ${webEnd} → ${dateFmt.format(hq.end)}`);
-  return out;
 }
 
 function buildEmptyMeta(overrides = {}) {
@@ -376,21 +292,9 @@ function buildEmptyMeta(overrides = {}) {
     typeStatus: 'none',
     checks: [],
     differences: [],
-    changes: [],
-    verdict: 'new',
     candidateRankings: [],
     ...overrides,
   };
-}
-
-// DEC-07: uncertainty is surfaced, never hidden. The operator asked never to
-// be blocked, so an uncertain pair still goes to Publish as an update to the
-// best candidate (the safe direction: it stays in front of them) and is
-// marked `guess` when a second website deal fits as well as the chosen one.
-function withRunnerUpCheck(meta, matrixRow, chosen) {
-  if (chosen === -1 || meta.verdict !== 'update') return meta;
-  const tied = matrixRow.some((m, j) => j !== chosen && m.sibling && m.score >= meta.score);
-  return tied ? { ...meta, guess: true } : meta;
 }
 
 function buildCandidateRankings(matrixRow, webGroup) {
@@ -411,7 +315,7 @@ function attachCandidateRankings(meta, matrixRow, webGroup) {
 }
 
 // Saved decisions belong to the candidate assignments produced by this version.
-export const MATCHER_VERSION = 8;
+export const MATCHER_VERSION = 3;
 
 // --- Assignment with an independent no-match option for every incoming deal ---
 
@@ -487,7 +391,7 @@ function greedyMatch(hqGroup, webGroup, matrix) {
     results.push({
       hq: hqGroup[i],
       web: a ? webGroup[a.webIdx] : null,
-      meta: attachCandidateRankings(a ? withRunnerUpCheck(a.meta, matrix[i], a.webIdx) : buildEmptyMeta(), matrix[i], webGroup),
+      meta: attachCandidateRankings(a ? a.meta : buildEmptyMeta(), matrix[i], webGroup),
     });
   }
   return results;
@@ -507,7 +411,7 @@ function optimalMatch(hqGroup, webGroup) {
     return assignment.map(([i, j]) => ({
       hq: hqGroup[i],
       web: j !== -1 ? webGroup[j] : null,
-      meta: attachCandidateRankings(j !== -1 ? withRunnerUpCheck(matrix[i][j], matrix[i], j) : buildEmptyMeta(), matrix[i], webGroup),
+      meta: attachCandidateRankings(j !== -1 ? matrix[i][j] : buildEmptyMeta(), matrix[i], webGroup),
     }));
   }
   return greedyMatch(hqGroup, webGroup, matrix);
@@ -539,7 +443,6 @@ function looksLikeDealContent(value) {
 export function parseHQ(text) {
   const lines = (text || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
   const items = [];
-  const seen = new Set();
   let currentVendor = null;
   let currentVendorResolution = null;
 
@@ -565,14 +468,7 @@ export function parseHQ(text) {
       if (!currentVendor) continue;
       const type = tag === 'ed' ? 'exclusive' : 'deal';
       const dates = parseHQDates(content);
-      // A corrected year typo is fixed in the text Publish receives too.
-      const text = dates.yearCorrection
-        ? content.replace(new RegExp(`/${dates.yearCorrection.from}(?!\\d)`), `/${dates.yearCorrection.to}`)
-        : content;
-      const markers = extractMarkers(text, { exclusive: type === 'exclusive' });
-      const identity = dealIdentity(currentVendor, type, text);
-      if (seen.has(identity)) continue;
-      seen.add(identity);
+      const markers = extractMarkers(content, { exclusive: type === 'exclusive' });
       items.push({
         id: ++nextId,
         type,
@@ -580,13 +476,12 @@ export function parseHQ(text) {
         vendorFamily: currentVendorResolution?.familyKey || norm(currentVendor),
         vendorStatus: currentVendorResolution?.status || 'unknown',
         vendorCandidates: currentVendorResolution?.candidates || [currentVendor],
-        text,
+        text: content,
         originalLine: line,
         start: dates.start,
         end: dates.end,
         ongoing: dates.ongoing,
         dateWarning: dates.dateWarning,
-        yearCorrection: dates.yearCorrection,
         markers,
       });
     }
@@ -671,42 +566,45 @@ export function runFullMatch(hqDeals, websiteDeals, { filterSupplier = '' } = {}
 }
 
 /**
- * Partitions comparison results by the matcher's verdict: `onSite` (identical
- * to a website deal), `update` (same deal on the site, terms or expiry
- * changed) and `added` (nothing comparable on the site). Deals ending today are always
- * excluded unless already on the site, and never reach the Publish payload.
- * A row whose match the operator rejected (`excludedHQIds`) becomes `added`.
+ * Partitions comparison results into two operator outcomes: `identical` rows
+ * (every marker agrees with a website deal, pre-checked as already on the
+ * site) and `work` rows (everything else: new deals, extensions, changed
+ * terms, or a row the operator pulled back). The optional ending-today rule
+ * is terminal and never reaches the Copy payload.
  */
 export function categorizeDedupeResults(
   results,
   {
     excludedHQIds = [],
+    excludeEndingToday = false,
     today = new Date(),
   } = {},
 ) {
   const pulledBack = new Set(excludedHQIds);
-  const buckets = { onSite: [], update: [], added: [] };
+  const identical = [];
+  const work = [];
   const excluded = [];
-  const bucketFor = { 'on-site': 'onSite', update: 'update', new: 'added' };
 
   for (const result of results || []) {
-    const verdict = result.web ? result.meta?.verdict : 'new';
-    if (sameDay(result.hq.end, today) && verdict !== 'on-site') {
+    if (excludeEndingToday && sameDay(result.hq.end, today) && !result.meta?.identical) {
       excluded.push({ ...result, exclusionReason: 'ending-today' });
       continue;
     }
     if (pulledBack.has(result.hq.id)) {
-      buckets.added.push({ ...result, meta: { ...result.meta, operatorRejectedMatch: true } });
+      work.push({ ...result, meta: { ...result.meta, operatorRejectedMatch: true } });
       continue;
     }
-    buckets[bucketFor[verdict] || 'added'].push(result);
+    if (result.web && result.meta?.identical) identical.push(result);
+    else work.push(result);
   }
 
   const byVendor = (a, b) => a.hq.vendor.localeCompare(b.hq.vendor) || a.hq.id - b.hq.id;
-  for (const rows of Object.values(buckets)) rows.sort(byVendor);
+  identical.sort(byVendor);
+  work.sort(byVendor);
 
   return {
-    ...buckets,
+    identical,
+    work,
     excluded,
     total: (results || []).length,
     today,
@@ -719,17 +617,9 @@ export function categorizeDedupeResults(
  * Serializes reviewed unmatched HQ records back to canonical tagged text for
  * the Copy step, preserving exclusivity and grouping suppliers alphabetically.
  */
-function dealIdentity(vendor, type, text) {
-  return JSON.stringify([vendor, type, text].map(value => String(value || '').trim().replace(/\s+/g, ' ').toLowerCase()));
-}
-
 export function exportUnmatched(deals) {
   const grouped = {};
-  const seen = new Set();
   deals.forEach(d => {
-    const identity = dealIdentity(d.vendor, d.type, d.text);
-    if (seen.has(identity)) return;
-    seen.add(identity);
     if (!grouped[d.vendor]) grouped[d.vendor] = [];
     grouped[d.vendor].push(d);
   });

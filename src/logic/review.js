@@ -1,19 +1,30 @@
-// The matcher decides every row; the operator may quietly override any
-// verdict. Decisions are 'on-site', 'update' or 'new'.
-const BUCKET = { 'on-site': 'onSite', update: 'update', new: 'added' };
+import { sameDay } from './dedupe.js';
 
+// The matcher pre-checks identical rows; only the operator confirms them.
+// Decisions are 'skip' (already on the site) or 'work' (goes to the list).
 export function buildReviewQueue(categorized, decisions = {}) {
-  const queue = { update: [], added: [], onSite: [], excluded: categorized?.excluded || [] };
-  if (!categorized) return queue;
-  for (const key of ['update', 'added', 'onSite']) {
-    for (const row of categorized[key]) {
-      const decision = decisions[row.hq.id];
-      // Update needs a website deal to update; without one it stays put.
-      const target = decision && !(decision === 'update' && !row.web) ? BUCKET[decision] : key;
-      queue[target].push(decision ? { ...row, decided: decision } : row);
-    }
+  if (!categorized) return { pending: [], skipped: [], work: [], excluded: [] };
+  const queue = { pending: [], skipped: [], work: [], excluded: categorized.excluded };
+  for (const row of categorized.identical) {
+    const decision = decisions[row.hq.id];
+    if (decision === 'work') queue.work.push(row);
+    else if (decision === 'skip') queue.skipped.push(row);
+    else queue.pending.push(row);
+  }
+  for (const row of categorized.work) {
+    if (decisions[row.hq.id] === 'skip') queue.skipped.push(row);
+    else queue.work.push(row);
   }
   const byVendor = (a, b) => a.hq.vendor.localeCompare(b.hq.vendor) || a.hq.id - b.hq.id;
-  for (const key of ['update', 'added', 'onSite']) queue[key].sort(byVendor);
+  queue.pending.sort(byVendor);
+  queue.skipped.sort(byVendor);
+  queue.work.sort(byVendor);
   return queue;
+}
+
+export function dateChange(row) {
+  if (row.hq.ongoing && row.web?.expiryDate) return 'Source is ongoing; website has an end date.';
+  if (row.hq.end && !row.web?.expiryDate) return 'Source has an end date; website has none.';
+  if (row.hq.end && row.web?.expiryDate && !sameDay(row.hq.end, row.web.expiryDate)) return 'End date differs — check the website date.';
+  return '';
 }
