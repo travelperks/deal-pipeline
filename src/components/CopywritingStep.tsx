@@ -526,7 +526,8 @@ export default function CopywritingStep({ session, onSessionChange, showToast })
               {group.deals.map((deal, dIdx) => {
                 if (!matchesFilter(deal, group)) return null;
                 const sourceAction = (session.sourceActions || []).find(item => item.vendor === group.name && item.text === deal.originalText);
-                const showSlug = sourceAction?.action !== "update";
+                // Every deal takes the same path; a likely update only carries a label.
+                const showSlug = true;
                 const noteKey = deal.dealId || `${vIdx}-${dIdx}`;
                 return (
                   <div
@@ -560,11 +561,21 @@ export default function CopywritingStep({ session, onSessionChange, showToast })
                         </div>
                       )}
 
-                      {sourceAction?.action === 'update' && <div className="comparison-alert">Update existing website deal: <a href={`https://travelperks.com/admin/content/entries/deals?source=section%3A8d00284b-fc9e-4b3e-8f03-ab319af6f0db&search=${encodeURIComponent(sourceAction.websiteTitle || group.name)}`} target="travelperks-admin" rel="noreferrer">{sourceAction.websiteTitle || group.name} ↗</a> · Keep its existing URL.</div>}
                       <div className="deal-meta-row">
                         <span className="pill">{deal.dealId}</span>
                         {deal.isExclusive && (
                           <span className="pill pill-bad">EXCLUSIVE</span>
+                        )}
+                        {sourceAction?.action === 'update' && (
+                          <a
+                            className="pill pill-warn possible-update"
+                            href={sourceAction.websiteUrl || `https://travelperks.com/admin/content/entries/deals?source=section%3A8d00284b-fc9e-4b3e-8f03-ab319af6f0db&search=${encodeURIComponent(sourceAction.websiteTitle || group.name)}`}
+                            target="travelperks-admin"
+                            referrerPolicy="no-referrer"
+                            title={`${sourceAction.reason || ''} Site entry: ${sourceAction.websiteTitle || group.name}`.trim()}
+                          >
+                            Possible update ↗
+                          </a>
                         )}
                       </div>
 

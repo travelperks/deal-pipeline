@@ -139,18 +139,45 @@ const TYPE_PATTERNS = [
 // on both sides regardless of how the website copy was phrased.
 const GENERIC_TYPES = new Set(["savings", "named-sale", "perks", "freebie"]);
 
-function extractMarkers(text, { exclusive = false } = {}) {
-  const types = new Set();
-  for (const [tag, re] of TYPE_PATTERNS) {
-    if (re.test(text)) types.add(tag);
-  }
-  if (types.has("named-sale")) { types.delete("named-sale"); types.add("savings"); }
-  const specific = [...types].filter(t => !GENERIC_TYPES.has(t));
-  if (specific.length || types.has("savings")) { types.delete("perks"); types.delete("freebie"); }
-  else if (types.has("perks")) types.delete("freebie");
-  // Savings paired with a concrete perk is common ("save + OBC") and is kept;
-  // savings alone is its own kind.
+// Words that carry no identity for a deal: grammar, sales filler, and the
+// date/exclusivity words that are compared as their own markers.
+const STOPWORDS = new Set(`a an the of on in at for to up your you with and or plus per pp from by is are be as this that our its it
+ ends end ending today ongoing exclusive tln ocapp select sailing voyage cruise vacation next get receive enjoy call agent speak
+ detail booking book new upcoming now off save saving sale offer rate fare deal promo promotion code capacity controlled free
+ will can all any more`.split(/\s+/));
 
+// Words that say what kind of offer it is rather than which promotion it is.
+const KIND_WORDS = new Set(`onboard credit discount bonus guest stateroom deposit reduced cabin suite person special extra
+ package amenity departure trip tour resort stay`.split(/\s+/));
+
+const NUMBER_WORDS = { one: '1', two: '2', three: '3', four: '4', five: '5', six: '6', seven: '7', eight: '8', nine: '9', ten: '10' };
+
+/** Reduces deal text to the set of words that identify it, spelled one way. */
+function tokenize(text) {
+  const t = (text || '').toLowerCase()
+    .replace(/\d{1,2}\/\d{1,2}(?:\/\w{2,5})?/g, ' ')
+    .replace(/(\d),(\d)/g, '$1$2')
+    .replace(/\bppgs?\b/g, ' prepaid gratuities ')
+    .replace(/\bobcs?\b/g, ' onboard credit ')
+    .replace(/\bshipboard\b|\bon\s+board\b/g, ' onboard ')
+    .replace(/\b2nd\b/g, ' second ').replace(/\b3rd\b/g, ' third ').replace(/\b4th\b/g, ' fourth ')
+    .replace(/\bmed\b/g, ' mediterranean ')
+    .replace(/\bnrd\b|\bdep\b/g, ' deposit ')
+    .replace(/\bsailors?\b/g, ' guest ')
+    .replace(/\bdinners?\b/g, ' dining ');
+  const tokens = new Set();
+  for (let word of t.split(/[^a-z0-9]+/)) {
+    if (!word) continue;
+    word = NUMBER_WORDS[word] || word;
+    if (STOPWORDS.has(word)) continue;
+    if (word.length > 3 && word.endsWith('s') && !word.endsWith('ss')) word = word.slice(0, -1);
+    if (word.endsWith('ie')) word = `${word.slice(0, -2)}y`;
+    if (!STOPWORDS.has(word)) tokens.add(word);
+  }
+  return tokens;
+}
+
+function figuresOf(text) {
   // Dollar, euro and pound figures share one set; the currency symbol is not
   // a marker on its own, only the figures are.
   const dollars = new Set();
@@ -158,12 +185,37 @@ function extractMarkers(text, { exclusive = false } = {}) {
     const val = parseInt((m[1] || m[2]).replace(/,/g, ''), 10);
     if (val > 0 && val < 100000) dollars.add(val);
   }
-
   const percents = new Set();
   for (const m of text.matchAll(/(\d{1,3})\s*%/g)) {
     const val = parseInt(m[1], 10);
     if (val > 0 && val <= 100) percents.add(val);
   }
+  // "BOGO60" is HQ shorthand for 60% off the second guest.
+  for (const m of text.matchAll(/\bbogo\s*(\d{2})\b/gi)) percents.add(parseInt(m[1], 10));
+  return { dollars, percents };
+}
+
+/**
+ * Reads the typed markers out of one deal's text: the kinds of offer, the
+ * money and percent figures, nights, exclusivity, and its identifying words.
+ * `head` is the part that states the offer itself (an incoming line without
+ * its parenthetical asides, or a website title without its description); its
+ * figures are the ones the other side must also carry.
+ */
+function extractMarkers(text, { exclusive = false, head } = {}) {
+  const types = new Set();
+  for (const [tag, re] of TYPE_PATTERNS) {
+    if (re.test(text)) types.add(tag);
+  }
+  if (/\bbogo\s*\d{2}\b/i.test(text)) types.add('multi-guest');
+  if (types.has("named-sale")) { types.delete("named-sale"); types.add("savings"); }
+  const specific = [...types].filter(t => !GENERIC_TYPES.has(t));
+  if (specific.length || types.has("savings")) { types.delete("perks"); types.delete("freebie"); }
+  else if (types.has("perks")) types.delete("freebie");
+
+  const { dollars, percents } = figuresOf(text);
+  const headText = head ?? text.replace(/\([^)]*\)/g, ' ');
+  const headFigures = figuresOf(headText);
 
   const nights = new Set();
   for (const m of text.matchAll(/\b(\d{1,2})\s*[-–]?\s*(?:nights?|nts?)\b/gi)) {
@@ -172,19 +224,14 @@ function extractMarkers(text, { exclusive = false } = {}) {
 
   const isExclusive = exclusive || types.has("covert") || /\[exclusive\]|\bexclusive\b|\btln\b/i.test(text);
 
-  return { types, exclusive: isExclusive, dollars, percents, nights };
+  return {
+    types, exclusive: isExclusive, dollars, percents, nights,
+    headDollars: headFigures.dollars, headPercents: headFigures.percents,
+    tokens: tokenize(text),
+  };
 }
 
 // --- Marker comparison ---
-
-const MARKER_LABELS = {
-  type: 'Type of offer',
-  exclusive: 'Exclusive',
-  expiry: 'Expiry',
-  dollars: 'Amounts',
-  percents: 'Percentages',
-  nights: 'Nights',
-};
 
 const TYPE_LABELS = {
   gratuities: 'Free gratuities', obc: 'Onboard credit', covert: 'Covert rate',
@@ -200,122 +247,138 @@ export function describeTypes(types) {
   return [...types].map(t => TYPE_LABELS[t] || t).join(' + ') || 'Unrecognized';
 }
 
-function setsEqual(a, b) {
-  return a.size === b.size && [...a].every(v => b.has(v));
-}
-function fmtSet(set, prefix = '', suffix = '') {
-  return [...set].sort((a, b) => a - b).map(v => `${prefix}${v.toLocaleString('en-US')}${suffix}`).join(', ');
+const subset = (a, b) => [...a].every(v => b.has(v));
+const shares = (a, b) => [...a].some(v => b.has(v));
+const shortDate = (d) => `${d.getMonth() + 1}/${d.getDate()}`;
+
+function fmtFigures(m) {
+  const money = [...m.dollars].sort((a, b) => a - b).map(v => `$${v.toLocaleString('en-US')}`);
+  const pct = [...m.percents].sort((a, b) => a - b).map(v => `${v}%`);
+  return [...money, ...pct].join(', ') || '—';
 }
 
-function compareTypes(hqTypes, webTypes) {
-  if (!hqTypes.size && !webTypes.size) return 'unknown';
-  if (setsEqual(hqTypes, webTypes)) return 'same';
-  // Website copy often adds generic "savings" wording around a concrete perk;
-  // when both sides name the same concrete kinds, that wording is noise.
-  const hqSpecific = new Set([...hqTypes].filter(t => !GENERIC_TYPES.has(t)));
-  const webSpecific = new Set([...webTypes].filter(t => !GENERIC_TYPES.has(t)));
-  if (hqSpecific.size && setsEqual(hqSpecific, webSpecific)) return 'same';
-  const overlap = [...hqTypes].filter(t => webTypes.has(t));
-  if (!overlap.length) return 'different';
-  return 'partial';
-}
-
-function compareSets(a, b) {
-  if (!a.size && !b.size) return 'n/a';
-  if (setsEqual(a, b)) return 'same';
-  return 'different';
-}
-
-function compareExpiry(hq, web) {
+/** How the two end dates relate, from the incoming deal's point of view. */
+function compareDates(hq, web) {
+  if (hq.end && web.expiryDate) return sameDay(hq.end, web.expiryDate) ? 'same' : 'different';
   if (hq.ongoing) return web.expiryDate ? 'different' : 'same';
-  if (!hq.end && !web.expiryDate) return 'n/a';
-  if (!hq.end || !web.expiryDate) return 'different';
-  return sameDay(hq.end, web.expiryDate) ? 'same' : 'different';
+  if (hq.end) return 'different';
+  // The source gives no date at all ("Capacity Controlled"), so there is
+  // nothing to hold against the website's date.
+  return 'open';
+}
+
+function dateReason(hq, web) {
+  if (hq.end && web.expiryDate) return `End date changed: the site says ${shortDate(web.expiryDate)}, this says ${shortDate(hq.end)}.`;
+  if (hq.ongoing) return `This is ongoing, but the site entry ends ${shortDate(web.expiryDate)}.`;
+  return `This ends ${shortDate(hq.end)}; the site entry has no end date.`;
 }
 
 /**
- * Compares one incoming deal with one website deal marker by marker. The
- * result is a checklist in the operator's order, an internal rank used only to
- * pick the best sibling per supplier, and `identical` when nothing differs.
+ * Decides what one website deal is to one incoming deal:
+ *   on-site — the same offer is already live; nothing to do
+ *   update  — probably the same promotion with a date or term changed
+ *   none    — not the same deal
+ * The decision uses typed markers only: kind of offer, the figures each side
+ * leads with, the end date, exclusivity, and shared promotion words.
  */
-function compareMarkers(hq, web) {
+function compareMarkers(hq, web, today = new Date()) {
   const H = hq.markers, W = web.markers;
-  const typeStatus = compareTypes(H.types, W.types);
+  const hqSpecific = new Set([...H.types].filter(t => !GENERIC_TYPES.has(t)));
+  const webSpecific = new Set([...W.types].filter(t => !GENERIC_TYPES.has(t)));
+  const sameKind = shares(H.types, W.types);
+  const sameSpecificKind = shares(hqSpecific, webSpecific);
+
+  // Website copy adds detail and incoming lines add asides, so each side's
+  // leading figures must appear somewhere on the other side.
+  const hasFigures = H.headDollars.size + H.headPercents.size + W.headDollars.size + W.headPercents.size > 0;
+  const nightsClash = H.nights.size > 0 && W.nights.size > 0 && !shares(H.nights, W.nights);
+  const figuresAgree = subset(H.headDollars, W.dollars) && subset(H.headPercents, W.percents)
+    && subset(W.headDollars, H.dollars) && subset(W.headPercents, H.percents) && !nightsClash;
+  const sharedFigure = shares(H.dollars, W.dollars) || shares(H.percents, W.percents);
+
+  const dates = compareDates(hq, web);
+  const datesAgree = dates === 'same' || dates === 'open';
+  const missingExclusive = H.exclusive && !W.exclusive;
+
+  const shared = [...H.tokens].filter(t => W.tokens.has(t));
+  const coverage = H.tokens.size ? shared.length / H.tokens.size : 0;
+  const isName = (t) => !KIND_WORDS.has(t) && !/^\d+$/.test(t);
+  const names = [...H.tokens].filter(isName);
+  const sharedNames = shared.filter(isName);
+  const sameName = sharedNames.length >= 2 || (sharedNames.length === 1 && names.length <= 2);
+
+  let verdict = 'none';
+  let reason = '';
+
+  const bothCovert = H.types.has('covert') && W.types.has('covert') && !(H.headDollars.size + H.headPercents.size);
+  if (bothCovert) {
+    // One hidden-rates entry stands for every covert rate code a supplier
+    // sends. Only a later, still-future end date is worth a look.
+    const later = hq.end && web.expiryDate && !sameDay(hq.end, web.expiryDate) && hq.end > web.expiryDate && hq.end >= today;
+    verdict = later ? 'update' : 'on-site';
+    reason = later ? dateReason(hq, web) : 'Covered by the hidden-rates entry on the site.';
+  } else if (sameKind || (!H.types.size && !W.types.size)) {
+    const sameOffer = hasFigures ? (sameKind && figuresAgree) : coverage >= 0.6;
+    if (sameOffer && datesAgree && !missingExclusive) {
+      verdict = 'on-site';
+      reason = hasFigures ? 'Same offer, same amounts, same end date.' : 'Same offer, same end date.';
+    } else if (sameOffer && datesAgree) {
+      verdict = 'update';
+      reason = 'Same offer, but the site entry is not marked exclusive.';
+    } else if (sameOffer && (!hasFigures || sharedFigure)) {
+      verdict = 'update';
+      reason = dateReason(hq, web);
+    } else if (dates === 'same' && sameSpecificKind && hasFigures) {
+      verdict = 'update';
+      reason = `Same kind of offer and end date, different amounts: the site says ${fmtFigures(W)}, this says ${fmtFigures(H)}.`;
+    } else if (sameKind && sameName) {
+      verdict = 'update';
+      reason = `Shares "${sharedNames.slice(0, 3).join(' ')}" with a site entry, but the terms differ.`;
+    }
+  }
+
+  let score = 0;
+  if (verdict !== 'none') {
+    score = verdict === 'on-site' ? 1000 : 200;
+    if (verdict === 'update' && figuresAgree && sharedFigure) score += 100;
+    if (dates === 'same') score += 60;
+    if (H.exclusive === W.exclusive) score += 30;
+    score += Math.round(coverage * 100) + sharedNames.length * 10;
+  }
+
   const checks = [
-    { key: 'type', status: typeStatus, hq: describeTypes(H.types), web: describeTypes(W.types) },
-    { key: 'exclusive', status: H.exclusive === W.exclusive ? 'same' : 'different', hq: H.exclusive ? 'Yes' : 'No', web: W.exclusive ? 'Yes' : 'No' },
-    { key: 'expiry', status: compareExpiry(hq, web), hq: hq.ongoing ? 'Ongoing' : hq.end ? dateFmt.format(hq.end) : '—', web: web.expiryDate ? dateFmt.format(web.expiryDate) : 'None' },
-    { key: 'dollars', status: compareSets(H.dollars, W.dollars), hq: fmtSet(H.dollars, '$') || '—', web: fmtSet(W.dollars, '$') || '—' },
-    { key: 'percents', status: compareSets(H.percents, W.percents), hq: fmtSet(H.percents, '', '%') || '—', web: fmtSet(W.percents, '', '%') || '—' },
-    { key: 'nights', status: compareSets(H.nights, W.nights), hq: fmtSet(H.nights, '', ' nights') || '—', web: fmtSet(W.nights, '', ' nights') || '—' },
-  ].map(c => ({ ...c, label: MARKER_LABELS[c.key] }));
-
-  const by = Object.fromEntries(checks.map(c => [c.key, c.status]));
-  const sameKind = typeStatus === 'same' || (typeStatus === 'unknown' && by.dollars === 'same');
-  const sibling = sameKind || typeStatus === 'partial';
-
-  // Rank only decides which website deal is shown beside the incoming one.
-  let rank = 0;
-  if (typeStatus === 'same') rank += 100;
-  else if (typeStatus === 'partial') rank += 50;
-  else if (typeStatus === 'unknown') rank += 10;
-  if (by.exclusive === 'same') rank += 20; else rank -= 20;
-  for (const k of ['dollars', 'percents', 'nights']) {
-    if (by[k] === 'same') rank += 15;
-    else if (by[k] === 'different') rank -= 10;
-  }
-  if (by.expiry === 'same') rank += 10;
-  else if (hq.end && web.expiryDate) {
-    const days = Math.abs(Math.round((hq.end - web.expiryDate) / 86400000));
-    if (days <= 90) rank += 3;
-  }
-
-  const identical = sameKind && checks.every(c => c.status === 'same' || c.status === 'n/a' || (c.key === 'type' && c.status === 'unknown'));
-  const differences = checks.filter(c => c.status === 'different').map(c => c.key);
+    { key: 'type', label: 'Offer', status: sameKind ? 'same' : 'different', hq: describeTypes(H.types), web: describeTypes(W.types) },
+    { key: 'figures', label: 'Amounts', status: !hasFigures ? 'n/a' : figuresAgree ? 'same' : 'different', hq: fmtFigures(H), web: fmtFigures(W) },
+    { key: 'expiry', label: 'Ends', status: datesAgree ? 'same' : 'different', hq: hq.ongoing ? 'Ongoing' : hq.end ? dateFmt.format(hq.end) : 'No date given', web: web.expiryDate ? dateFmt.format(web.expiryDate) : 'No end date' },
+    { key: 'exclusive', label: 'Exclusive', status: H.exclusive === W.exclusive ? 'same' : 'different', hq: H.exclusive ? 'Yes' : 'No', web: W.exclusive ? 'Yes' : 'No' },
+  ];
 
   return {
-    score: sibling ? Math.max(rank, 1) : 0,
-    identical,
-    sibling,
-    typeStatus,
+    score,
+    verdict,
+    reason,
+    identical: verdict === 'on-site',
+    covert: bothCovert,
     checks,
-    differences,
-    candidateRankings: [],
+    differences: checks.filter(c => c.status === 'different').map(c => c.key),
   };
 }
 
 function buildEmptyMeta(overrides = {}) {
   return {
     score: 0,
+    verdict: 'new',
+    reason: overrides.noWebDeals ? 'This supplier has nothing on the site yet.' : 'Nothing like it on the site for this supplier.',
     identical: false,
-    sibling: false,
-    typeStatus: 'none',
+    covert: false,
     checks: [],
     differences: [],
-    candidateRankings: [],
     ...overrides,
   };
 }
 
-function buildCandidateRankings(matrixRow, webGroup) {
-  if (!matrixRow || !webGroup?.length) return [];
-  return matrixRow
-    .map((meta, index) => ({
-      title: webGroup[index]?.raw?.title || webGroup[index]?.text || '',
-      score: meta.score,
-      identical: meta.identical,
-      types: describeTypes(webGroup[index]?.markers?.types || new Set()),
-    }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 3);
-}
-
-function attachCandidateRankings(meta, matrixRow, webGroup) {
-  return { ...meta, candidateRankings: buildCandidateRankings(matrixRow, webGroup) };
-}
-
 // Saved decisions belong to the candidate assignments produced by this version.
-export const MATCHER_VERSION = 3;
+export const MATCHER_VERSION = 4;
 
 // --- Assignment with an independent no-match option for every incoming deal ---
 
@@ -366,55 +429,47 @@ export function assignCandidateMatrix(matrix, n, m) {
   return result;
 }
 
-function greedyMatch(hqGroup, webGroup, matrix) {
-  const usedWeb = new Set();
-  const results = [];
-  const candidates = [];
-  for (let i = 0; i < hqGroup.length; i++) {
-    for (let j = 0; j < webGroup.length; j++) {
-      candidates.push({ i, j, meta: matrix[i][j] });
-    }
-  }
-  candidates.sort((a, b) => b.meta.score - a.meta.score);
-  const assignedHQ = new Set();
-  const assignment = new Map();
-  for (const c of candidates) {
-    if (assignedHQ.has(c.i) || usedWeb.has(c.j)) continue;
-    if (c.meta.score > 0) {
-      assignment.set(c.i, { webIdx: c.j, meta: c.meta });
-      assignedHQ.add(c.i);
-      usedWeb.add(c.j);
-    }
-  }
-  for (let i = 0; i < hqGroup.length; i++) {
-    const a = assignment.get(i);
-    results.push({
-      hq: hqGroup[i],
-      web: a ? webGroup[a.webIdx] : null,
-      meta: attachCandidateRankings(a ? a.meta : buildEmptyMeta(), matrix[i], webGroup),
-    });
-  }
-  return results;
-}
 
-function optimalMatch(hqGroup, webGroup) {
-  const n = hqGroup.length, m = webGroup.length;
-  const matrix = [];
-  for (let i = 0; i < n; i++) {
-    matrix[i] = [];
-    for (let j = 0; j < m; j++) {
-      matrix[i][j] = compareMarkers(hqGroup[i], webGroup[j]);
+/**
+ * Pairs one supplier's incoming deals with its website deals. Covert rates
+ * are settled first and may share a single hidden-rates entry; every other
+ * incoming deal gets at most one website deal of its own, chosen so that the
+ * most deals overall are recognized as already live.
+ */
+function optimalMatch(hqGroup, webGroup, today) {
+  const out = new Map();
+  const rest = [];
+  for (const hq of hqGroup) {
+    let best = null;
+    for (const web of webGroup) {
+      const meta = compareMarkers(hq, web, today);
+      if (meta.covert && (!best || meta.score > best.meta.score)) best = { web, meta };
+    }
+    if (best) out.set(hq, best);
+    else rest.push(hq);
+  }
+
+  const n = rest.length, m = webGroup.length;
+  const matrix = rest.map(hq => webGroup.map(web => compareMarkers(hq, web, today)));
+  let pairs;
+  if (n <= 20 && m <= 20) {
+    pairs = assignCandidateMatrix(matrix, n, m);
+  } else {
+    const cells = [];
+    matrix.forEach((row, i) => row.forEach((meta, j) => { if (meta.score > 0) cells.push({ i, j, score: meta.score }); }));
+    cells.sort((a, b) => b.score - a.score);
+    const takenHQ = new Set(), takenWeb = new Set();
+    pairs = rest.map((_, i) => [i, -1]);
+    for (const c of cells) {
+      if (takenHQ.has(c.i) || takenWeb.has(c.j)) continue;
+      takenHQ.add(c.i); takenWeb.add(c.j);
+      pairs[c.i] = [c.i, c.j];
     }
   }
-  if (n <= 20 && m <= 20) {
-    const assignment = assignCandidateMatrix(matrix, n, m);
-    return assignment.map(([i, j]) => ({
-      hq: hqGroup[i],
-      web: j !== -1 ? webGroup[j] : null,
-      meta: attachCandidateRankings(j !== -1 ? matrix[i][j] : buildEmptyMeta(), matrix[i], webGroup),
-    }));
+  for (const [i, j] of pairs) {
+    out.set(rest[i], j !== -1 ? { web: webGroup[j], meta: matrix[i][j] } : { web: null, meta: buildEmptyMeta() });
   }
-  return greedyMatch(hqGroup, webGroup, matrix);
+  return hqGroup.map(hq => ({ hq, ...out.get(hq) }));
 }
 
 // --- HQ Parser ---
@@ -506,7 +561,7 @@ export function ingestWebsiteJSON(arr) {
     const expiry = row.expiryDate ? new Date(row.expiryDate) : null;
     const post = row.postDate ? new Date(row.postDate) : null;
     const text = [row.title || '', row.shopListing || ''].join(' · ');
-    const markers = extractMarkers(text);
+    const markers = extractMarkers(text, { head: row.title || '' });
     return {
       raw: row,
       supplier: vendor,
@@ -529,7 +584,7 @@ export function ingestWebsiteJSON(arr) {
  * Missing website candidates remain explicit unmatched results, and an optional
  * supplier filter narrows HQ work without changing the candidate evidence.
  */
-export function runFullMatch(hqDeals, websiteDeals, { filterSupplier = '' } = {}) {
+export function runFullMatch(hqDeals, websiteDeals, { filterSupplier = '', today = new Date() } = {}) {
   const filterResolution = filterSupplier ? resolveVendor(filterSupplier) : null;
   const filterName = filterResolution?.canonicalName || filterSupplier;
   const hqByFamily = {};
@@ -559,18 +614,17 @@ export function runFullMatch(hqDeals, websiteDeals, { filterSupplier = '' } = {}
         });
       }
     } else {
-      allResults.push(...optimalMatch(hqGroup, webGroup));
+      allResults.push(...optimalMatch(hqGroup, webGroup, today));
     }
   }
   return allResults;
 }
 
 /**
- * Partitions comparison results into two operator outcomes: `identical` rows
- * (every marker agrees with a website deal, pre-checked as already on the
- * site) and `work` rows (everything else: new deals, extensions, changed
- * terms, or a row the operator pulled back). The optional ending-today rule
- * is terminal and never reaches the Copy payload.
+ * Partitions comparison results into two outcomes: `identical` rows (already
+ * live on the site, set aside) and `work` rows (everything to add or update:
+ * new deals, extensions, changed terms, or a row the operator pulled back).
+ * The optional ending-today rule is terminal and never reaches Publish.
  */
 export function categorizeDedupeResults(
   results,

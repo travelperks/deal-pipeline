@@ -1,4 +1,4 @@
-import React, { useMemo, useCallback, useRef, useState } from 'react';
+import React, { useMemo, useCallback, useEffect, useRef, useState } from 'react';
 import {
   parseHQ, resetIds, ingestWebsiteJSON, runFullMatch,
   categorizeDedupeResults, exportUnmatched, sameDay, dateFmt,
@@ -7,32 +7,41 @@ import {
 import { buildReviewQueue } from '../logic/review.js';
 import { validateWebsiteExport } from '../logic/dealCoreClient';
 
+const ADMIN_SEARCH = 'https://travelperks.com/admin/content/entries/deals?source=section%3A8d00284b-fc9e-4b3e-8f03-ab319af6f0db&search=';
+
 function parseWebsiteRows(text) {
   const data = JSON.parse(text);
   return Array.isArray(data) ? data : data.entries || data.data || [];
 }
 
+// A short fingerprint of the loaded export, so a saved comparison can be
+// recognized after a reload without storing the export twice.
+function signatureOf(rows) {
+  const text = JSON.stringify(rows || []);
+  let hash = 5381;
+  for (let i = 0; i < text.length; i++) hash = ((hash << 5) + hash + text.charCodeAt(i)) | 0;
+  return `${(rows || []).length}:${hash}`;
+}
+
+function adminLink(row) {
+  return row.web?.raw?.cpEditUrl || `${ADMIN_SEARCH}${encodeURIComponent(row.web?.raw?.title || row.hq.vendor)}`;
+}
+
 /**
- * Orchestrates website-export validation, supplier-scoped marker matching, and
- * the operator's two-way sort: rows identical to the website are pre-checked
- * for bulk confirmation, everything else is the work list handed to
- * Copywriting. Matcher inputs are frozen into `lastRun`.
+ * Compares the tagged batch with the website export by rule and lands on one
+ * number and one button: the deals to add or update. Deals already live are
+ * set aside without asking and stay one tab away; the operator can move any
+ * row either way. Comparison starts by itself once both inputs exist, and the
+ * whole step accepts a dropped website export.
  */
 export default function DedupeStep({ session, onSessionChange, onComplete, showToast }) {
   const fileRef = useRef(null);
   const [importError, setImportError] = useState('');
+  const [dragging, setDragging] = useState(false);
   const [search, setSearch] = useState('');
-  const [lastDecision, setLastDecision] = useState(null);
   const decisions = session.decisions || {};
-  const activeView = ['work', 'identical'].includes(session.viewFilter) ? session.viewFilter : 'work';
-
-  const {
-    hqText,
-    websiteRows,
-    lastRun,
-    supplierFilter,
-    restrictToday,
-  } = session;
+  const view = session.viewFilter === 'identical' ? 'identical' : 'work';
+  const { hqText, websiteRows, lastRun, supplierFilter, restrictToday } = session;
 
   const updateSession = useCallback((patch) => {
     onSessionChange((prev) => (
@@ -46,160 +55,147 @@ export default function DedupeStep({ session, onSessionChange, onComplete, showT
     return parseHQ(hqText);
   }, [hqText]);
 
-  const websiteDeals = useMemo(() => ingestWebsiteJSON(websiteRows), [websiteRows]);
-  const webSuppliers = useMemo(
-    () => [...new Set(websiteDeals.map((deal) => deal.supplier))].sort(),
-    [websiteDeals],
-  );
+  const webSignature = useMemo(() => signatureOf(websiteRows), [websiteRows]);
+  const canCompare = hqDeals.length > 0 && websiteRows.length > 0;
+  const current = !!lastRun && lastRun.matcherVersion === MATCHER_VERSION
+    && lastRun.hqText === hqText && lastRun.webSignature === webSignature
+    && (lastRun.supplierFilter || '') === (supplierFilter || '');
+
+  // Compare as soon as both inputs exist; any change to either starts over.
+  useEffect(() => {
+    if (!canCompare || current) return;
+    updateSession({
+      lastRun: { matcherVersion: MATCHER_VERSION, hqText, webSignature, supplierFilter },
+      decisions: {},
+      viewFilter: 'work',
+    });
+  }, [canCompare, current, hqText, webSignature, supplierFilter, updateSession]);
 
   const results = useMemo(() => {
-    if (!lastRun) return null;
-    if (lastRun.matcherVersion !== MATCHER_VERSION) return null;
-    if (!lastRun.hqText.trim() || !lastRun.websiteRows.length) return null;
+    if (!canCompare || !current) return null;
     resetIds();
-    const lastRunDeals = parseHQ(lastRun.hqText);
-    const lastRunWebsiteDeals = ingestWebsiteJSON(lastRun.websiteRows);
-    return runFullMatch(lastRunDeals, lastRunWebsiteDeals, {
-      filterSupplier: lastRun.supplierFilter,
-    });
-  }, [lastRun]);
+    return runFullMatch(parseHQ(hqText), ingestWebsiteJSON(websiteRows), { filterSupplier: supplierFilter });
+  }, [canCompare, current, hqText, websiteRows, supplierFilter]);
 
-  const categorized = useMemo(() => {
-    if (!results) return null;
-    return categorizeDedupeResults(results, {
-      excludeEndingToday: restrictToday,
-    });
-  }, [results, restrictToday]);
-
+  const categorized = useMemo(
+    () => (results ? categorizeDedupeResults(results, { excludeEndingToday: restrictToday }) : null),
+    [results, restrictToday],
+  );
   const queue = useMemo(() => buildReviewQueue(categorized, decisions), [categorized, decisions]);
-  const filtered =(rows) => rows.filter((row) => `${row.hq.vendor} ${row.hq.text} ${row.web?.raw?.title || ''}`.toLowerCase().includes(search.toLowerCase()));
+  const endingToday = useMemo(
+    () => (results || []).filter((row) => sameDay(row.hq.end, new Date()) && !row.meta?.identical).length,
+    [results],
+  );
+  const webSuppliers = useMemo(
+    () => [...new Set(ingestWebsiteJSON(websiteRows).map((deal) => deal.supplier))].sort(),
+    [websiteRows],
+  );
+  const dateWarnings = useMemo(() => hqDeals.filter((deal) => deal.dateWarning), [hqDeals]);
+
   const decide = (id, value) => {
-    setLastDecision({ previous: { ...decisions } });
     const next = { ...decisions };
     if (value === undefined) delete next[id]; else next[id] = value;
     updateSession({ decisions: next });
   };
-  const undo = () => {
-    if (!lastDecision) return;
-    updateSession({ decisions: lastDecision.previous });
-    setLastDecision(null);
-  };
 
-  const dateWarnings = useMemo(() => hqDeals.filter((deal) => deal.dateWarning), [hqDeals]);
-
-  const handleFileLoad = useCallback(async (event) => {
-    const file = event.target.files?.[0];
+  const loadExport = useCallback(async (file) => {
     if (!file) return;
-
     try {
-      const text = await file.text();
-      const rows = parseWebsiteRows(text);
+      const rows = parseWebsiteRows(await file.text());
       const validation = await validateWebsiteExport(rows);
-
       if ('error' in validation) {
         setImportError(validation.error.message);
-        updateSession({ websiteRows: [], lastRun: null, decisions: {} });
         showToast('Website export not recognized', 'error');
         return;
       }
-
       setImportError('');
       updateSession({ websiteRows: validation.data.rows, websiteFileName: file.name, lastRun: null, decisions: {} });
-      showToast(
-        `${validation.data.recognizedCount} website deals loaded`,
-        'success',
-      );
+      showToast(`${validation.data.recognizedCount} website deals loaded`, 'success');
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setImportError(`Could not read this JSON file: ${message}`);
-      updateSession({ websiteRows: [], lastRun: null, decisions: {} });
-      showToast('Failed to parse website JSON', 'error');
-    } finally {
-      event.target.value = '';
+      setImportError(`That file isn't a website export (${error instanceof Error ? error.message : String(error)}).`);
+      showToast('Could not read that file', 'error');
     }
   }, [showToast, updateSession]);
 
-  const runMatcher = useCallback(() => {
-    if (!hqDeals.length) {
-      showToast('Paste HQ text first', 'error');
-      return;
-    }
-    if (!websiteRows.length) {
-      showToast('Load website JSON first', 'error');
-      return;
-    }
+  const dropProps = {
+    onDragOver: (event) => { event.preventDefault(); setDragging(true); },
+    onDragLeave: () => setDragging(false),
+    onDrop: (event) => { event.preventDefault(); setDragging(false); loadExport(event.dataTransfer.files?.[0]); },
+  };
+  const fileInput = <input ref={fileRef} type="file" accept=".json" hidden onChange={(event) => { loadExport(event.target.files?.[0]); event.target.value = ''; }} />;
 
-    updateSession({
-      lastRun: {
-        matcherVersion: MATCHER_VERSION,
-        hqText,
-        websiteRows,
-        supplierFilter,
-      },
-      decisions: {},
-      viewFilter: 'work',
-    });
-    setLastDecision(null);
-  }, [hqDeals.length, hqText, showToast, supplierFilter, updateSession, websiteRows]);
-
-
-  const handleExportWork = async () => {
-    if (!queue.work.length) return;
+  const handleCopyList = async () => {
     try {
       await navigator.clipboard.writeText(exportUnmatched(queue.work.map(row => row.hq)));
-      showToast('Work list copied', 'success');
+      showToast('List copied', 'success');
     } catch { showToast('Clipboard unavailable. Please try again.', 'error'); }
   };
-  const handleSendToCopy = () => {
+  // Every row takes the same path through Publish. A likely update only
+  // carries a label and a link to the entry it may replace.
+  const handleSend = () => {
     if (!queue.work.length) return;
-    // A same-kind website sibling means the operator will edit that entry
-    // rather than create a new one, so Copywriting keeps its URL.
-    onComplete(exportUnmatched(queue.work.map(row => row.hq)), queue.work.map(row => ({
-      vendor: row.hq.vendor,
-      text: row.hq.text,
-      action: row.web && ['same', 'partial'].includes(row.meta?.typeStatus) && !row.meta?.operatorRejectedMatch ? 'update' : 'new',
-      websiteTitle: row.web?.raw?.title || '',
-    })));
+    onComplete(exportUnmatched(queue.work.map(row => row.hq)), queue.work.map(row => {
+      const update = row.web && row.meta?.verdict === 'update' && decisions[row.hq.id] !== 'work';
+      return {
+        vendor: row.hq.vendor,
+        text: row.hq.text,
+        action: update ? 'update' : 'new',
+        websiteTitle: update ? row.web.raw?.title || '' : '',
+        websiteUrl: update ? adminLink(row) : '',
+        reason: update ? row.meta.reason : '',
+      };
+    }));
   };
 
-  const canCompare = hqDeals.length > 0 && websiteDeals.length > 0;
-  const sourceVendorCount = new Set(hqDeals.map((deal) => deal.vendor)).size;
+  if (!hqDeals.length) {
+    return <div className="cmp-empty"><p className="cmp-empty-head">Nothing to compare yet.</p><p className="cmp-empty-sub">Tag this week's deals first.</p></div>;
+  }
+
+  if (!websiteRows.length) {
+    return <div className={`cmp-empty cmp-drop ${dragging ? 'is-dragging' : ''}`} {...dropProps} onClick={() => fileRef.current?.click()} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') fileRef.current?.click(); }} role="button" tabIndex={0}>
+      <p className="cmp-empty-head">Drop this week's website export here.</p>
+      <p className={`cmp-empty-sub ${importError ? 'is-error' : ''}`}>{importError || `Or click anywhere to choose it. ${hqDeals.length} tagged deals are waiting.`}</p>
+      {fileInput}
+    </div>;
+  }
+
+  if (!categorized) return <div className="cmp-empty"><p className="cmp-empty-head">Comparing…</p></div>;
+
+  const rows = view === 'work' ? queue.work : queue.skipped;
+  const needle = search.trim().toLowerCase();
+  const shown = needle
+    ? rows.filter((row) => `${row.hq.vendor} ${row.hq.text} ${row.web?.raw?.title || ''}`.toLowerCase().includes(needle))
+    : rows;
+  const groups = [];
+  for (const row of shown) {
+    const last = groups[groups.length - 1];
+    if (last && last.vendor === row.hq.vendor) last.rows.push(row);
+    else groups.push({ vendor: row.hq.vendor, rows: [row] });
+  }
+  const updates = queue.work.filter((row) => row.web && row.meta?.verdict === 'update' && decisions[row.hq.id] !== 'work').length;
+  const total = queue.work.length + queue.skipped.length + queue.excluded.length;
 
   return (
-    <div className="dedupe-step dedupe-workflow">
-      <section className="dedupe-setup">
-        <div className="dedupe-section-heading">
-          <div><span className="workspace-eyebrow">Prepare the comparison</span><h3>Find what needs your attention.</h3></div>
-          {lastRun && <span className="status-chip status-complete">Comparison ready</span>}
-        </div>
-        <div className="dedupe-setup-grid">
-          <article className={`setup-card ${hqDeals.length ? 'is-ready' : ''}`}>
-            <span className="setup-index">1</span>
-            <div className="setup-card-copy"><span className="setup-label">New deal batch</span><strong>{hqDeals.length ? `${hqDeals.length} deals from ${sourceVendorCount} suppliers` : 'No deals loaded'}</strong><span>{hqDeals.length ? 'Carried forward from Tag' : 'Complete the Tag step first'}</span></div>
-            <span className="setup-check">{hqDeals.length ? '✓' : ''}</span>
-          </article>
-          <article className={`setup-card ${websiteDeals.length ? 'is-ready' : ''}`}>
-            <span className="setup-index">2</span>
-            <div className="setup-card-copy"><span className="setup-label">Current website</span><strong>{websiteDeals.length ? `${websiteDeals.length} live deals loaded` : 'Load the website export'}</strong><button className="setup-link" onClick={() => fileRef.current?.click()}>{websiteDeals.length ? `Replace ${session.websiteFileName || 'JSON export'}` : 'Choose true_entries.json'}</button></div>
-            <span className="setup-check">{websiteDeals.length ? '✓' : ''}</span>
-            <input ref={fileRef} type="file" accept=".json" className="visually-hidden" onChange={handleFileLoad} />
-          </article>
-          <article className={`setup-card setup-action ${canCompare ? 'is-ready' : ''}`}>
-            <span className="setup-index">3</span>
-            <div className="setup-card-copy"><span className="setup-label">Compare</span><strong>{canCompare ? 'Find what is already live' : 'Waiting for both inputs'}</strong><span>Review matches, keep new and changed deals.</span></div>
-            <button className="btn btn-accent compare-button" onClick={runMatcher} disabled={!canCompare}>{lastRun ? 'Compare again' : 'Compare deals'}</button>
-          </article>
-        </div>
-        {importError && <div className="gate-warning gate-warning-error import-blocker" role="alert"><strong>That website export could not be used.</strong><div>{importError}</div></div>}
-        <details className="dedupe-disclosure">
-          <div className="advanced-grid">
-            <label className="advanced-source"><span>Tagged source</span><textarea value={hqText} onChange={(event) => updateSession({ hqText: event.target.value, lastRun: null, decisions: {} })} spellCheck={false} /></label>
-            <div className="advanced-controls">
-              <label className="mini-label">Supplier <select value={supplierFilter} onChange={(event) => updateSession({ supplierFilter: event.target.value, lastRun: null, decisions: {} })}><option value="">All suppliers</option>{webSuppliers.map((supplier) => <option key={String(supplier)}>{String(supplier)}</option>)}</select></label>
-              <button className={`btn ${restrictToday ? 'btn-danger' : ''}`} onClick={() => updateSession({ restrictToday: !restrictToday })}>Exclude ending today: {restrictToday ? 'On' : 'Off'}</button>
-            </div>
+    <div className={`cmp ${dragging ? 'is-dragging' : ''}`} {...dropProps}>
+      <section className="cmp-hero">
+        <div className="cmp-hero-copy">
+          <h3>{queue.work.length ? `${queue.work.length} ${queue.work.length === 1 ? 'deal' : 'deals'} to add or update` : 'Nothing to add or update'}</h3>
+          <p>
+            {queue.skipped.length} of {total} are already on the site and were set aside.
+            {updates > 0 && ` ${updates} of the ${queue.work.length} may be updates to entries that are already there.`}
+            {queue.excluded.length > 0 && ` ${queue.excluded.length} ending today left out.`}
+          </p>
+          <div className="cmp-hero-meta">
+            <button className="cmp-link" onClick={() => fileRef.current?.click()}>Replace {session.websiteFileName || 'website export'}</button>
+            {(endingToday > 0 || restrictToday) && <label className="cmp-check"><input type="checkbox" checked={!!restrictToday} onChange={() => updateSession({ restrictToday: !restrictToday })} /> Leave out {endingToday} ending today</label>}
+            {importError && <span className="cmp-error" role="alert">{importError}</span>}
           </div>
-        </details>
+        </div>
+        <div className="cmp-hero-actions">
+          <button className="btn btn-forward cmp-send" disabled={!queue.work.length} onClick={handleSend}>Send {queue.work.length} to Publish →</button>
+          <button className="cmp-link" disabled={!queue.work.length} onClick={handleCopyList}>Copy as text</button>
+        </div>
+        {fileInput}
       </section>
 
       {dateWarnings.length > 0 && (
@@ -209,93 +205,78 @@ export default function DedupeStep({ session, onSessionChange, onComplete, showT
         </details>
       )}
 
-      {categorized ? (
-        <section className="dedupe-results">
-          <div className="results-hero">
-            <div><span className="workspace-eyebrow">Your work list</span><h3>{queue.work.length} to work on · {queue.skipped.length} already on the site</h3><p>{queue.pending.length ? `${queue.pending.length} look identical to the website. Confirm them to set them aside.` : 'Everything identical has been set aside.'}</p></div>
-            <div className="results-actions">
-              <button className="btn" disabled={!queue.work.length || !!queue.pending.length} onClick={handleExportWork}>Copy work list</button>
-              <button className="btn btn-forward" disabled={!queue.work.length || !!queue.pending.length} onClick={handleSendToCopy}>{queue.pending.length ? `Confirm ${queue.pending.length} identical first` : `Send ${queue.work.length} to Publish →`}</button>
-            </div>
-          </div>
-          <div className="review-toolbar">
-            <div className="review-tabs" aria-label="Comparison views">
-              <button className={`btn ${activeView === 'work' ? 'btn-accent' : ''}`} onClick={() => updateSession({ viewFilter: 'work' })}>Work list · {queue.work.length}</button>
-              <button className={`btn ${activeView === 'identical' ? 'btn-accent' : ''}`} onClick={() => updateSession({ viewFilter: 'identical' })}>Already on site · {queue.pending.length + queue.skipped.length}{queue.pending.length ? ` (${queue.pending.length} to confirm)` : ''}</button>
-            </div>
-            <label className="review-search">Find a deal<input value={search} onChange={e => setSearch(e.target.value)} placeholder="Supplier or offer…" /></label>
-            <button className="btn" disabled={!lastDecision} onClick={undo}>Undo last decision</button>
-          </div>
-          {activeView === 'identical' && queue.pending.length > 0 && <div className="review-finish"><span>{queue.pending.length} pre-checked as identical: same type, exclusivity, amounts, and expiry. Glance through, pull any into the work list, then confirm the rest.</span><button className="btn btn-success" onClick={() => {
-            setLastDecision({ previous: { ...decisions } });
-            updateSession({ decisions: { ...decisions, ...Object.fromEntries(queue.pending.map(row => [row.hq.id, 'skip'])) } });
-          }}>Confirm all {queue.pending.length} as already on site</button></div>}
-          <div className="compact-card-list">
-            {activeView === 'work' && filtered(queue.work).map(row => <MatchCard key={row.hq.id} r={row} today={categorized.today} onDecision={decide} state="work" />)}
-            {activeView === 'identical' && filtered(queue.pending).map(row => <MatchCard key={row.hq.id} r={row} today={categorized.today} onDecision={decide} state="pending" />)}
-            {activeView === 'identical' && filtered(queue.skipped).map(row => <MatchCard key={row.hq.id} r={row} today={categorized.today} onDecision={decide} state="skipped" />)}
-          </div>
-          {!filtered(activeView === 'work' ? queue.work : [...queue.pending, ...queue.skipped]).length && <div className="dedupe-empty"><h3>{search ? 'No deals match your search' : activeView === 'work' ? 'Nothing to work on' : 'Nothing identical to the website'}</h3><p>{activeView === 'work' && !search ? 'Every incoming deal is already on the site.' : 'Your other list is available above.'}</p></div>}
-          {!!queue.excluded.length && <details className="dedupe-disclosure"><summary>Excluded by ending-today policy · {queue.excluded.length}</summary>{queue.excluded.map(row => <p key={row.hq.id} className="review-hint">{row.hq.vendor} · {row.hq.text}</p>)}</details>}
+      <div className="cmp-bar">
+        <div className="cmp-tabs" role="tablist" aria-label="Comparison lists">
+          <button role="tab" aria-selected={view === 'work'} className={view === 'work' ? 'is-active' : ''} onClick={() => updateSession({ viewFilter: 'work' })}>To add or update <span>{queue.work.length}</span></button>
+          <button role="tab" aria-selected={view === 'identical'} className={view === 'identical' ? 'is-active' : ''} onClick={() => updateSession({ viewFilter: 'identical' })}>Already on the site <span>{queue.skipped.length}</span></button>
+        </div>
+        <input className="cmp-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Find a supplier or offer…" aria-label="Find a deal" />
+      </div>
+
+      {!shown.length && <div className="cmp-none">{needle ? 'No deals match your search.' : view === 'work' ? 'Every incoming deal is already on the site.' : 'Nothing was set aside.'}</div>}
+
+      {groups.map((group) => (
+        <section key={group.vendor} className="cmp-group">
+          <h4><a href={`${ADMIN_SEARCH}${encodeURIComponent(group.vendor)}`} target="travelperks-admin" referrerPolicy="no-referrer" title={`Open ${group.vendor} deals in the website admin`}>{group.vendor}</a><span>{group.rows.length}</span></h4>
+          {group.rows.map((row) => <DealRow key={row.hq.id} row={row} view={view} decision={decisions[row.hq.id]} onDecision={decide} />)}
         </section>
-      ) : <div className="dedupe-empty"><h3>{lastRun && lastRun.matcherVersion !== MATCHER_VERSION ? 'Matching has improved — compare again' : 'Load your website export, then compare'}</h3><p>{lastRun && lastRun.matcherVersion !== MATCHER_VERSION ? 'Your inputs are saved. Run a fresh comparison before reviewing the updated candidates.' : 'Your saved source and website file stay here while you move between steps.'}</p></div>}
+      ))}
+
+      {queue.excluded.length > 0 && <details className="dedupe-disclosure"><summary>Left out because they end today · {queue.excluded.length}</summary>{queue.excluded.map(row => <p key={row.hq.id} className="review-hint">{row.hq.vendor} · {row.hq.text}</p>)}</details>}
+
+      <details className="dedupe-disclosure">
+        <summary>Options</summary>
+        <div className="advanced-grid">
+          <label className="advanced-source"><span>Tagged source</span><textarea value={hqText} onChange={(event) => updateSession({ hqText: event.target.value, lastRun: null, decisions: {} })} spellCheck={false} /></label>
+          <div className="advanced-controls">
+            <label className="mini-label">Supplier <select value={supplierFilter} onChange={(event) => updateSession({ supplierFilter: event.target.value, lastRun: null, decisions: {} })}><option value="">All suppliers</option>{webSuppliers.map((supplier) => <option key={String(supplier)}>{String(supplier)}</option>)}</select></label>
+          </div>
+        </div>
+      </details>
     </div>
   );
 }
 
-const STATUS_GLYPH = { same: '✓', different: '✗', partial: '~', unknown: '?', 'n/a': '–' };
+const GLYPH = { same: '✓', different: '✗', 'n/a': '–' };
 
-function MarkerChecklist({ checks }) {
-  if (!checks?.length) return null;
-  return <table className="marker-checklist">
-    <thead><tr><th>Marker</th><th>Incoming</th><th>Website</th></tr></thead>
-    <tbody>
-      {checks.map(check => <tr key={check.key} className={`marker-${check.status}`}>
-        <th scope="row"><span className="marker-glyph" aria-hidden="true">{STATUS_GLYPH[check.status] || '?'}</span>{check.label}</th>
-        <td>{check.hq}</td>
-        <td>{check.web}</td>
-      </tr>)}
-    </tbody>
-  </table>;
-}
-
-function differenceSummary(r) {
-  if (!r.web) return r.meta?.noWebDeals ? 'This supplier has no deals on the website yet.' : 'No similar deal on the website for this supplier.';
-  if (r.meta?.operatorRejectedMatch) return 'You pulled this into the work list.';
-  const labels = { type: 'type of offer', exclusive: 'exclusivity', expiry: 'expiry date', dollars: 'amounts', percents: 'percentages', nights: 'nights' };
-  const diffs = (r.meta?.differences || []).map(key => labels[key] || key);
-  if (r.meta?.typeStatus === 'partial') diffs.unshift('type only partly overlaps');
-  if (!diffs.length) return '';
-  return `Differs on ${diffs.join(', ')}.`;
-}
-
-function MatchCard({ r, today, onDecision, state }) {
-  const summary = differenceSummary(r);
-  const isIdentical = state !== 'work';
-  return <article className={`match-card review-card card-${state}`}>
-    <div className="match-header">
-      <span className="supplier-name">{r.hq.vendor}</span>
-      {r.hq.type === 'exclusive' && <span className="pill pill-purple">Exclusive</span>}
-      {state === 'pending' && <span className="pill pill-ok">Looks identical</span>}
-      {state === 'skipped' && <span className="pill">Already on site</span>}
-      {state === 'work' && !r.web && <span className="pill pill-accent">New</span>}
-      {state === 'work' && r.web && <span className="pill pill-warn">Changed</span>}
-      {sameDay(r.hq.end, today) && <span className="pill pill-warn">Ends today</span>}
-    </div>
-    {summary && <div className={`comparison-summary ${isIdentical ? 'is-quiet' : ''}`}>{summary}</div>}
-    <div className="match-grid">
-      <div className="match-side match-side-incoming"><h4>Incoming</h4><p className="match-text">{r.hq.text}</p><div className="match-meta">{r.hq.ongoing ? 'Ongoing' : r.hq.end ? `Ends ${dateFmt.format(r.hq.end)}` : 'No end date in source'}</div></div>
-      <div className="match-side match-side-website"><h4>{r.web ? 'On the website' : 'Website'}</h4>{r.web ? <><p className="match-text">{r.web.raw?.title || r.web.text}</p><p className="website-description">{r.web.raw?.shopListing || ''}</p><div className="match-meta">{r.web.expiryDate ? `Ends ${dateFmt.format(r.web.expiryDate)}` : 'No website expiry'}</div></> : <p className="match-text match-text-empty">Nothing similar</p>}</div>
-    </div>
-    {r.web && <MarkerChecklist checks={r.meta?.checks} />}
-    <div className="card-actions">
-      {state === 'work' && <button className="btn btn-success" onClick={() => onDecision(r.hq.id, 'skip')}>Already on site</button>}
-      {state === 'pending' && <><button className="btn btn-success" onClick={() => onDecision(r.hq.id, 'skip')}>Confirm · already on site</button><button className="btn btn-reject" onClick={() => onDecision(r.hq.id, 'work')}>Move to work list</button></>}
-      {state === 'skipped' && <button className="btn" onClick={() => onDecision(r.hq.id, 'work')}>Move to work list</button>}
-      {state === 'work' && r.meta?.operatorRejectedMatch === undefined && r.meta?.identical && <button className="btn" onClick={() => onDecision(r.hq.id, undefined)}>Undo</button>}
-      {r.web && <a className="btn" href={`https://travelperks.com/admin/entries/deals?search=${encodeURIComponent(r.web.raw?.title || r.hq.vendor)}`} target="travelperks-admin" rel="noreferrer">Find on website ↗</a>}
-    </div>
-    {r.meta?.candidateRankings?.length > 1 && <details className="match-evidence"><summary>Other website deals for {r.hq.vendor}</summary>
-      {r.meta.candidateRankings.map((candidate, index) => <p className="match-meta" key={index}><strong>{candidate.title}</strong> · {candidate.types}</p>)}</details>}
-  </article>;
+function DealRow({ row, view, decision, onDecision }) {
+  const [open, setOpen] = useState(false);
+  const moved = decision === (view === 'work' ? 'work' : 'skip');
+  const verdict = row.meta?.verdict;
+  const isUpdate = view === 'work' && row.web && verdict === 'update' && !moved;
+  const reason = moved
+    ? (view === 'work' ? 'You moved this back onto the list.' : 'You set this aside.')
+    : (view === 'identical' || isUpdate) ? row.meta?.reason : '';
+  return (
+    <article className={`cmp-row ${isUpdate ? 'is-update' : ''}`}>
+      <div className="cmp-row-main">
+        <p className="cmp-row-text">
+          {row.hq.type === 'exclusive' && <span className="pill pill-purple">Exclusive</span>}
+          {isUpdate && <span className="pill pill-warn">Possible update</span>}
+          {sameDay(row.hq.end, new Date()) && <span className="pill">Ends today</span>}
+          {row.hq.text}
+        </p>
+        {reason && <p className="cmp-row-why">{reason}</p>}
+        {row.web && (view === 'identical' || isUpdate) && (
+          <p className="cmp-row-site">
+            <span>On the site</span>
+            <a href={adminLink(row)} target="travelperks-admin" referrerPolicy="no-referrer">{row.web.raw?.title || row.web.text} ↗</a>
+            <em>{row.web.expiryDate ? `ends ${dateFmt.format(row.web.expiryDate)}` : 'no end date'}</em>
+            {row.meta?.checks?.length > 0 && <button className="cmp-link" onClick={() => setOpen(!open)} aria-expanded={open}>{open ? 'Hide comparison' : 'Compare'}</button>}
+          </p>
+        )}
+        {open && row.web && (
+          <table className="cmp-checks">
+            <thead><tr><th></th><th>This deal</th><th>Site entry</th></tr></thead>
+            <tbody>{row.meta.checks.map((check) => (
+              <tr key={check.key} className={`is-${check.status}`}><th scope="row"><span aria-hidden="true">{GLYPH[check.status] || '–'}</span> {check.label}</th><td>{check.hq}</td><td>{check.web}</td></tr>
+            ))}</tbody>
+          </table>
+        )}
+      </div>
+      {view === 'work'
+        ? <button className="btn cmp-row-action" onClick={() => onDecision(row.hq.id, row.meta?.identical ? undefined : 'skip')}>Already on site</button>
+        : <button className="btn cmp-row-action" onClick={() => onDecision(row.hq.id, row.meta?.identical ? 'work' : undefined)}>Add to list</button>}
+    </article>
+  );
 }

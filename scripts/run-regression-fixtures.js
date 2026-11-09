@@ -247,8 +247,8 @@ Up to 35% Savings & up to $250 OBC: Ends 8/31/2026`;
   const norwegianMatch = findMatch(matches, "Norwegian");
   assert.equal(norwegianMatch.web?.supplier, "Norwegian");
   assert.ok(
-    norwegianMatch.meta.sibling,
-    "Expected Norwegian alias match to find a same-kind website sibling.",
+    norwegianMatch.meta.verdict !== "new",
+    "Expected Norwegian alias match to find its website deal.",
   );
   assert.ok(
     norwegianMatch.meta.checks.some((check) => check.key === "type" && /Onboard credit/.test(check.hq)),
@@ -257,12 +257,12 @@ Up to 35% Savings & up to $250 OBC: Ends 8/31/2026`;
 
   const royalMatch = findMatch(matches, "Royal Caribbean");
   assert.equal(royalMatch.web?.supplier, "Royal Caribbean");
-  assert.ok(royalMatch.meta.sibling, "Expected Royal Caribbean to find a same-kind website sibling.");
+  assert.ok(royalMatch.meta.verdict !== "new", "Expected Royal Caribbean to find its website deal.");
 
   const carnivalMatch = findMatch(matches, "Carnival");
   assert.equal(carnivalMatch.web, null);
   assert.equal(carnivalMatch.meta.noWebDeals, true);
-  assert.deepEqual(carnivalMatch.meta.candidateRankings, []);
+  assert.equal(carnivalMatch.meta.verdict, "new");
 
   const categorized = categorizeDedupeResults(matches, {
     excludedHQIds: [norwegianMatch.hq.id],

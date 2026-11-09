@@ -10,18 +10,17 @@ const rows = [
 ];
 const categories = categorizeDedupeResults(rows);
 let queue = buildReviewQueue(categories);
-assert.deepEqual(queue.pending.map(r => r.hq.id), [2], 'Identical rows are pre-checked and wait for confirmation');
+assert.deepEqual(queue.skipped.map(r => r.hq.id), [2], 'Rows already on the site are set aside without a confirmation step');
 assert.deepEqual(queue.work.map(r => r.hq.id), [1, 3], 'Extensions and new deals go straight to the work list');
-queue = buildReviewQueue(categories, { 2: 'skip' });
 assert.equal(queue.pending.length, 0);
 const payload = exportUnmatched(queue.work.map(r => r.hq));
 assert.ok(payload.includes('Save 20%'));
 assert.ok(payload.includes('New offer'));
-assert.ok(!payload.includes('Free drinks'), 'Confirmed identical deals must never enter the copy payload');
+assert.ok(!payload.includes('Free drinks'), 'Deals already on the site must never enter the copy payload');
 assert.equal(queue.work.length + queue.skipped.length + queue.pending.length, rows.length);
 assert.deepEqual(buildReviewQueue(categories, { 2: 'work' }).work.map(r => r.hq.id), [1, 2, 3], 'A pre-checked row can be pulled into the work list');
-assert.deepEqual(buildReviewQueue(categories, { 1: 'skip' }).skipped.map(r => r.hq.id), [1], 'A work row can be set aside as already on site');
-assert.equal(buildReviewQueue(categories, {}).pending[0].hq.id, 2, 'Undo restores the pre-check');
+assert.deepEqual(buildReviewQueue(categories, { 1: 'skip' }).skipped.map(r => r.hq.id), [1, 2], 'A work row can be set aside as already on site');
+assert.equal(buildReviewQueue(categories, {}).skipped[0].hq.id, 2, 'Undo puts the row back where the matcher had it');
 assert.ok(dateChange(rows[0]));
 assert.equal(dateChange({ ...rows[0], web: { expiryDate: rows[0].hq.end } }), '');
 

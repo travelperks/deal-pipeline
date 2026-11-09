@@ -7,7 +7,7 @@ import { parseRawEmail } from './logic/dealCoreClient';
 
 const STEPS = [
   { key: 'tag', label: 'Tag', desc: 'Prepare the source', intro: 'Turn the weekly source into clean, structured deal lines.' },
-  { key: 'dedupe', label: 'Compare', desc: 'Find the work', intro: 'Review the weakest matches first. Keep only new offers and changes.' },
+  { key: 'dedupe', label: 'Compare', desc: 'Find the work', intro: 'Deals already on the site are set aside. What is left is your list.' },
   { key: 'copy', label: 'Publish', desc: 'Review & copy', intro: 'Check the copy, move each field to the website, and track what’s done.' },
 ];
 
@@ -172,7 +172,7 @@ export default function App() {
         houseStyle: prev.copy.houseStyle,
       },
     }));
-    showToast('Tagged text loaded into Dedupe', 'success');
+    showToast('Tagged deals sent to Compare', 'success');
   }, [showToast]);
 
   const handleDedupeComplete = useCallback((text, sourceActions = []) => {
@@ -186,7 +186,7 @@ export default function App() {
         houseStyle: prev.copy.houseStyle,
       },
     }));
-    showToast('New and changed deals loaded into Copywriting', 'success');
+    showToast('Your list is ready in Publish', 'success');
   }, [showToast]);
 
   const handleGlobalReset = useCallback(() => {
